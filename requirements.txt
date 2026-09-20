@@ -1,0 +1,12 @@
+# agent / API
+fastapi
+uvicorn
+httpx
+pyyaml
+sqlglot
+psycopg[binary]
+
+# dbt + governed metrics (Postgres). Run `dbt parse` after editing semantic YAML.
+dbt-core>=1.12
+dbt-postgres>=1.11
+dbt-metricflow>=0.15
