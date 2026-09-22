@@ -37,6 +37,16 @@ def test_percent_from_fraction():
     assert ungrounded("The refund rate is 9.1%.", "refund rate?", TRACE) == ["9.1%"]
 
 
+def test_percent_over_100_is_not_wrongly_flagged():
+    # net_revenue_growth_mom of 1.6617333... (166.2%) was wrongly flagged: the x100 conversion
+    # only applied to a raw value within +/-1, which a growth metric can legitimately exceed
+    growth = [step("net_revenue_growth_mom", 1.6617333480753738)]
+    assert ungrounded("Growth was +166.2%.", "growth?", growth) == []
+    assert ungrounded("Growth was -63.5%.", "growth?",
+                      [step("net_revenue_growth_mom", -0.6354522945816778)]) == []
+    assert ungrounded("Growth was 200.0%.", "growth?", growth) == ["200.0%"]  # still catches a wrong one
+
+
 def test_rounding_and_suffix():
     assert ungrounded("Roughly $20,486 net.", "q", TRACE) == []
     assert ungrounded("About $20.5k net.", "q", TRACE) == []

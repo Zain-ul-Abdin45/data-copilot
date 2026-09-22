@@ -52,12 +52,23 @@ def scripts(engine: str) -> dict[str, list[tuple[str, dict]]]:
         "net_revenue_total": [("query_metric", {"metrics": ["net_revenue"]})],
         "gross_vs_net": [("query_metric", {"metrics": ["gross_revenue", "refunded_revenue"]})],
         "refund_rate": [("query_metric", {"metrics": ["refund_rate"]})],
+        "refund_rate_mom_change": [("query_metric", {"metrics": ["refund_rate"], "group_by": [month],
+                                                     "order_by": [month]}),
+                                   ("derive", {"operation": "period_over_period_change"})],
         "cancellation_count": [("query_metric", {"metrics": ["cancelled_order_count"]})],
         "aov": [("query_metric", {"metrics": ["average_order_value"]})],
         "net_revenue_q2": [("query_metric", {"metrics": ["net_revenue"], "start_date": "2026-04-01",
                                              "end_date": "2026-06-30"})],
         "net_revenue_by_month": [("query_metric", {"metrics": ["net_revenue"], "group_by": [month],
                                                    "order_by": [month]})],
+        "net_revenue_growth_mom": ([("query_metric", {"metrics": ["net_revenue_growth_mom"], "group_by": [month],
+                                                      "order_by": [month]})] if mf else
+                                   # Wren's cubes are imported from dbt models, not MetricFlow's
+                                   # semantic layer, so there is no offset_window metric to ask
+                                   # for; the best a good model can do is the plain metric,
+                                   # which correctly fails the growth values (a declared gap).
+                                   [("query_metric", {"metrics": ["net_revenue"], "group_by": [month],
+                                                      "order_by": [month]})]),
         "orders_by_status": [("query_metric", {"metrics": ["order_count"], "group_by": [status],
                                                "order_by": [status] if mf else []})],
         "top_customers": top,
@@ -75,7 +86,9 @@ def scripts(engine: str) -> dict[str, list[tuple[str, dict]]]:
 EXPECTED_GAPS = {
     "metricflow": {},
     "wren": {"top_customers": "the cube API cannot sort, so the governed tool cannot answer top-N",
-             "net_revenue_by_month": "month buckets are labelled a few hours before the month start"},
+             "net_revenue_by_month": "month buckets are labelled a few hours before the month start",
+             "net_revenue_growth_mom": "no offset_window metric: Wren's cubes come from dbt models, "
+                                       "not MetricFlow's semantic layer"},
 }
 
 WORDS = {

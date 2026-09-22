@@ -76,7 +76,9 @@ def _allowed(question: str, trace: list[dict]) -> tuple[set[float], set[float]]:
         exact |= _date_ints(str(rows))
         cells = [float(v) for row in rows for v in row if _numeric(v)]
         exact.update(cells)
-        exact.update(c * 100 for c in cells if abs(c) <= 1)  # a fraction reported as a percent
+        # A fraction reported as a percent: not bounded to +/-1, since a period-over-period
+        # growth metric can legitimately exceed 100% (net_revenue_growth_mom of 1.66 is "166%").
+        exact.update(c * 100 for c in cells)
         (singles if len(rows) == 1 else others).extend(cells)
         for col in zip(*rows):
             nums = [float(v) for v in col if _numeric(v)]
@@ -115,3 +117,9 @@ def ungrounded(text: str, question: str, trace: list[dict]) -> list[str]:
         if fig["raw"] not in bad:
             bad.append(fig["raw"])
     return bad
+
+
+def matches(fig: dict, candidates) -> bool:
+    """Public form of the figure comparison: is this stated figure one of the candidates,
+    to the precision it was stated in?"""
+    return _matches(fig, set(candidates))

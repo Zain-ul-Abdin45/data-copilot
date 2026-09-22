@@ -199,6 +199,156 @@ def runner_and_compare():
     return True, "a crashed question is recorded and the run continues; Ctrl+C keeps partial results; compare.py reads them and names missing files"
 
 
+def tool_contracts():
+    """The real tools, no model: the guards and wording the agent depends on."""
+    import semantic
+    from catalog import search_catalog
+
+    import os
+
+    problems = []
+    env_before = {k: os.environ.get(k) for k in ("PGUSER", "PGPASSWORD", "PGHOST")}
+    described = semantic.describe_metrics("refund rate")["metrics"][0]
+    if "order__status" in described["group_by_options"] or described.get("not_groupable_by") != ["order__status"]:
+        problems.append("describe_metrics still offers order__status for refund_rate")
+    if "error" not in semantic.query_metric(["refund_rate"], group_by=["order__status"]):
+        problems.append("refund_rate by status was not refused")
+    overall = semantic.query_metric(["refund_rate"])
+    if "error" in overall or abs(overall["rows"][0][0] - 0.0833) > 0.001:
+        problems.append(f"overall refund_rate wrong: {overall}")
+    by_status = semantic.query_metric(["net_revenue"], group_by=["order__status"])
+    if "error" in by_status or by_status["row_count"] != 5:
+        problems.append("net_revenue by status must still work")
+    if {k: os.environ.get(k) for k in env_before} != env_before:
+        problems.append("starting the MetricFlow engine changed PG* environment variables (they leak "
+                        "into other connections and subprocesses)")
+    unmatched = semantic.describe_metrics("average delivery time")
+    inner = unmatched.get("catalog_search", {})
+    if unmatched["metrics"] or "not available" not in inner.get("note", "") or "delivery" not in inner.get("terms_with_no_match", []):
+        problems.append("describe_metrics on an absent topic must include a catalog search that says "
+                        f"the data is not available: {str(unmatched)[:150]}")
+    missing = search_catalog("average delivery time in days")
+    if "delivery" not in missing.get("terms_with_no_match", []) or "not available" not in missing.get("note", ""):
+        problems.append(f"an absent topic must be reported as not available: {missing.get('note')}")
+    return not problems, "; ".join(problems) or (
+        "rates refuse their own dimension, other metrics still group, an absent topic is reported as unavailable")
+
+
+import contextlib
+
+
+@contextlib.contextmanager
+def _serve_ui():
+    """The interface (stub agent, no model) on a free port; yields (port, page_html)."""
+    import os
+    import socket
+    import urllib.request
+
+    ui = ROOT / "ui"
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    proc = subprocess.Popen([str(Path(PY).parent / "chainlit"), "run", "app.py", "--host", "127.0.0.1",
+                             "--port", str(port), "--headless"], cwd=ui,
+                            env={**os.environ, "COPILOT_UI_STUB": "1"},
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        page, deadline = None, time.time() + 60
+        while time.time() < deadline and proc.poll() is None:
+            try:
+                page = urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=3).read().decode()
+                break
+            except OSError:
+                time.sleep(1)
+        if page is None:
+            proc.terminate()
+            raise RuntimeError("the interface did not start:\n" + (proc.communicate(timeout=10)[0] or "")[-800:])
+        yield port, page
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def ui_server():
+    """The interface starts, serves its page and settings, and its page makes no third-party
+    requests. Uses the stub agent, so no model is involved."""
+    import urllib.request
+
+    ui = ROOT / "ui"
+    if not (ui / "app.py").exists():
+        return True, "skipped: no ui/ folder"
+    sh([PY, str(ui / "harden.py")])
+    if sh([PY, str(ui / "harden.py"), "--check"]).returncode != 0:
+        return False, "Chainlit's page still loads third-party hosts (Google Fonts / jsDelivr)"
+    with _serve_ui() as (port, page):
+        external = [h for h in ("fonts.googleapis.com", "fonts.gstatic.com", "cdn.jsdelivr.net") if h in page]
+        if external:
+            return False, f"the served page still references {external}"
+        conf = json.loads(urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/project/settings?language=en-US", timeout=5).read())
+        starters = conf.get("starters") or conf.get("ui", {}).get("starters") or []
+    return True, f"starts on a free port, serves its page and settings ({len(starters)} starters), no third-party requests"
+
+
+def ui_conversation():
+    """Two messages through the real Chainlit runtime over its socket, the way the browser sends
+    them: answer, charts and side panel arrive, no errors, and the second turn sees the first."""
+    import asyncio
+    import datetime as dt
+    import uuid
+
+    import socketio
+
+    if not (ROOT / "ui" / "app.py").exists():
+        return True, "skipped: no ui/ folder"
+
+    async def talk(port):
+        sio, events = socketio.AsyncClient(), []
+
+        @sio.on("*")
+        async def collect(event, *args):
+            events.append((event, args[0] if args else None))
+
+        await sio.connect(f"http://127.0.0.1:{port}", socketio_path="/ws/socket.io", transports=["websocket"],
+                          auth={"sessionId": str(uuid.uuid4()), "userEnv": "{}", "clientType": "webapp",
+                                "chatProfile": "", "threadId": ""})
+        await sio.emit("connection_successful")
+        await asyncio.sleep(1)
+        for text in ("Show net revenue by month.", "And the refund rate?"):
+            done = sum(e == "task_end" for e, _ in events)
+            await sio.emit("client_message", {"message": {
+                "id": str(uuid.uuid4()), "name": "User", "type": "user_message", "output": text,
+                "createdAt": dt.datetime.now(dt.timezone.utc).isoformat()}, "fileReferences": []})
+            for _ in range(60):
+                await asyncio.sleep(0.5)
+                if sum(e == "task_end" for e, _ in events) > done and any(
+                        e == "new_message" and "stub" in json.dumps(a, default=str) for e, a in events[-12:]):
+                    break
+        await sio.disconnect()
+        return events
+
+    with _serve_ui() as (port, _):
+        events = asyncio.run(talk(port))
+    blob = [(e, json.dumps(a, default=str)) for e, a in events]
+    problems = []
+    if any('"isError": true' in b for _, b in blob) or any(e == "error" for e, _ in blob):
+        problems.append("an error event was sent to the browser")
+    answers = [b for e, b in blob if e == "new_message" and "stub, turn" in b]
+    if len(answers) != 2 or "**Governed metric**" not in answers[0]:
+        problems.append(f"expected two answers starting with the governed badge, got {len(answers)}")
+    elif "stub, turn 2" not in answers[1]:
+        problems.append("the second turn did not receive the first (history is not carried)")
+    plotly = [b for e, b in blob if e == "element" and '"type": "plotly"' in b and '"display": "inline"' in b]
+    side = [b for e, b in blob if e == "element" and "How this was calculated" in b and '"display": "side"' in b]
+    if len(plotly) != 4 or len(side) != 2:
+        problems.append(f"expected 4 inline charts and 2 side panels, got {len(plotly)} and {len(side)}")
+    return not problems, "; ".join(problems) or (
+        "two turns handled: badge, text, inline charts and side panel arrive, no errors, history carried")
+
+
 def resume_check():
     """--resume keeps finished runs, does only the rest, and refuses mismatched settings."""
     with tempfile.TemporaryDirectory() as d:
@@ -288,10 +438,13 @@ CHECKS = [  # (name, function, in --fast)
     ("night scripts, results dir, disk", night_scripts, True),
     ("dbt project fresh, dbt tests", dbt_project, False),
     ("glossary maps to defined metrics", glossary, False),
+    ("tool contracts: guards and wording (real tools)", tool_contracts, False),
     ("oracle: MetricFlow (real tools, scripted model)", lambda: oracle("metricflow"), False),
     ("oracle: Wren (real tools, scripted model)", lambda: oracle("wren"), False),
     ("eval runner survives crashes; compare.py", runner_and_compare, False),
     ("eval runner --resume", resume_check, False),
+    ("interface starts (stub agent, no model)", ui_server, False),
+    ("interface handles a conversation (stub agent)", ui_conversation, False),
 ]
 
 

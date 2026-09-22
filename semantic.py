@@ -8,6 +8,10 @@ import math
 import os
 import re
 
+import sqlglot
+from sqlglot import exp
+
+import datasources
 import db
 import dbtproject
 import settings
@@ -24,11 +28,22 @@ def _engine():
     if _cfg is None or mtime != _loaded_mtime:
         from dbt_metricflow.cli.cli_configuration import CLIConfiguration
 
-        # MetricFlow connects with whatever the dbt profile says: force the read-only role.
-        os.environ.update(PGUSER=settings.DB_USER, PGPASSWORD=settings.DB_PASSWORD,
-                          PGHOST=settings.DB_HOST)
-        cfg = CLIConfiguration()
-        cfg.setup(dbt_profiles_path=settings.DBT_DIR, dbt_project_path=settings.DBT_DIR)
+        # MetricFlow connects with whatever dbt profile target DBT_TARGET names: force the
+        # active engine's own credentials, but only while it reads the profile. Left in
+        # os.environ these would leak into every other connection and subprocess of this
+        # process (e.g. the Postgres target would connect everywhere as copilot_ro).
+        forced = {"DBT_TARGET": settings.DBT_TARGET, **datasources.get().dbt_env()}
+        saved = {k: os.environ.get(k) for k in forced}
+        os.environ.update(forced)
+        try:
+            cfg = CLIConfiguration()
+            cfg.setup(dbt_profiles_path=settings.DBT_DIR, dbt_project_path=settings.DBT_DIR)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
         _cfg, _loaded_mtime = cfg, mtime
     return _cfg.mf
 
@@ -36,11 +51,12 @@ def _engine():
 # ---- what exists -----------------------------------------------------------
 
 def _rules() -> dict:
+    ds = datasources.get()
     return {
         "order_status_rules": db.query_dicts(
             "select status, counts_in_gross_revenue, is_refund, counts_as_net_order, rule "
-            "from order_status_rules order by status"),
-        "glossary": db.query_dicts("select term, metric, rule from glossary order by term"),
+            f"from {ds.qualify('order_status_rules')} order by status"),
+        "glossary": db.query_dicts(f"select term, metric, rule from {ds.qualify('glossary')} order by term"),
     }
 
 
@@ -60,8 +76,33 @@ def _formula(m) -> str:
     return kind
 
 
+def defining_dimensions(metric_name: str) -> set[str]:
+    """Dimensions a ratio metric is built from, e.g. refund_rate is built from order__status
+    (its numerator counts orders with status = 'refunded'). Grouping or filtering such a metric
+    by that dimension gives only 0% or 100% per group, which says nothing, so it is refused.
+    Derived from the measure expressions, so new metrics are covered without a list to maintain."""
+    manifest = dbtproject.load(dbtproject.SEMANTIC_MANIFEST)
+    metric = next((m for m in manifest["metrics"] if m["name"] == metric_name), None)
+    if metric is None or metric["type"] != "ratio":
+        return set()
+    wanted = {x["name"] for x in metric["type_params"].get("input_measures", [])}
+    found: set[str] = set()
+    for model in manifest["semantic_models"]:
+        entity = model.get("primary_entity") or next(
+            e["name"] for e in model["entities"] if e["type"] == "primary")
+        dims = {(d.get("expr") or d["name"]): f"{entity}__{d['name']}"
+                for d in model["dimensions"] if d["type"] == "categorical"}
+        for measure in model["measures"]:
+            if measure["name"] in wanted:
+                columns = {c.name for c in sqlglot.parse_one(measure["expr"], read="postgres").find_all(exp.Column)}
+                found |= {dims[c] for c in columns if c in dims}
+    return found
+
+
 def _group_by_options(m) -> list[str]:
-    names = sorted({d.dunder_name for d in m.dimensions if not d.dunder_name.startswith("metric_time")})
+    blocked = defining_dimensions(m.name)
+    names = sorted({d.dunder_name for d in m.dimensions
+                    if not d.dunder_name.startswith("metric_time") and d.dunder_name not in blocked})
     return names + ["metric_time__day|week|month|quarter|year"]
 
 
@@ -84,23 +125,39 @@ def describe_metrics(term: str | None = None) -> dict:
     if exact:
         chosen = [m for m in metrics if m.name in exact]
     else:
-        words = {w for w in q.split() if len(w) > 2}
+        # A metric must cover at least half of the question's meaningful words. One shared word
+        # ("average" in "average delivery time") must not present average_order_value as an answer.
+        import catalog
+
+        words = catalog.content_terms(q)
+        need = max(1, -(-len(words) // 2))
         scored = []
         for m in metrics:
-            hay = _norm(f"{m.name} {m.label} {m.description}")
-            score = sum(1 for w in words if w in hay)
-            if score:
-                scored.append((score, m))
+            named = catalog.tokens(f"{m.name.replace('_', ' ')} {m.label}")
+            hit = len(words & (named | catalog.tokens(m.description)))
+            if words and hit >= need:
+                # a word in the name or label counts double: "how much was refunded" must rank
+                # refunded_revenue above metrics that only mention "refunded" in passing
+                scored.append((hit + 2 * len(words & named), m))
         chosen = [m for _, m in sorted(scored, key=lambda x: -x[0])[:5]]
 
     if not chosen:
-        return {"metrics": [], "note": "No governed metric matches. Call describe_metrics with no "
-                                       "term to list them all, or use search_catalog."}
+        from catalog import search_catalog
+
+        # No metric is not the same as no data: check the tables and columns in the same call
+        return {"metrics": [], "catalog_search": search_catalog(term),
+                "note": (f"No governed metric matches {term!r}. That alone does not mean the data is "
+                         "missing, so the catalog was searched too (catalog_search). If it also finds "
+                         "nothing about what was asked, tell the user plainly that this data is not "
+                         "available in the warehouse; do not stop at 'no governed metric'.")}
     names = {m.name for m in chosen}
     return {
         "metrics": [{"name": m.name, "label": m.label, "description": m.description,
                      "type": m.type.value, "formula": _formula(m),
-                     "group_by_options": _group_by_options(m)} for m in chosen],
+                     "group_by_options": _group_by_options(m),
+                     **({"not_groupable_by": sorted(defining_dimensions(m.name)),
+                         "why": "this rate is defined over that dimension, so per-group values are only 0% or 100%"}
+                        if defining_dimensions(m.name) else {})} for m in chosen],
         "glossary": [g for g in rules["glossary"] if g["metric"] in names or _norm(g["term"]) == q],
         "business_rules": rules["order_status_rules"],
     }
@@ -161,6 +218,20 @@ def query_metric(metrics: list[str], group_by: list[str] | None = None,
                  limit: int | None = None) -> dict:
     """Query governed metrics. Errors come back as text with suggestions so the
     model can correct itself."""
+    if not order_by:
+        # a trend must read left to right: MetricFlow returns buckets in no particular order
+        order_by = [g for g in group_by or [] if g.startswith("metric_time")] or None
+    asked = set(group_by or []) | {f.get("dimension") for f in filters or []}
+    for name in metrics:
+        clash = sorted(defining_dimensions(name) & asked)
+        if clash:
+            return {"error": (f"{name} is defined over {clash[0]} (its measures are built from it), so "
+                              f"grouping or filtering it by {clash[0]} only gives 0% or 100% per group "
+                              "and says nothing."),
+                    "hint": (f"Ask for {name} without {clash[0]}. For a comparison, group it by a "
+                             "different dimension such as time. For 'would X change the rate' "
+                             "questions, get the overall value first.")}
+
     from metricflow.engine.metricflow_engine import MetricFlowQueryRequest
 
     try:

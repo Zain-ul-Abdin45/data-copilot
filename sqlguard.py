@@ -10,6 +10,7 @@ is fine and `with x as (delete from t returning *) select * from x` is not.
 import sqlglot
 from sqlglot import exp
 
+import datasources
 import settings
 
 
@@ -30,9 +31,11 @@ _BLOCKED_PREFIXES = ("pg_", "lo_", "dblink", "set_config", "current_setting", "q
 
 def validate(sql: str, allowed_tables: set[str]) -> tuple[str, list[str]]:
     """Return (safe_sql, tables_used) or raise SqlRejected with a message the
-    model can act on."""
+    model can act on. Parses and re-renders in whichever engine is active
+    (datasources.get()), so the same guard covers Postgres, DuckDB and Trino."""
+    ds = datasources.get()
     try:
-        statements = [s for s in sqlglot.parse(sql, read="postgres") if s is not None]
+        statements = [s for s in sqlglot.parse(sql, read=ds.dialect) if s is not None]
     except sqlglot.errors.SqlglotError as e:
         raise SqlRejected(f"Could not parse the SQL: {str(e)[:200]}")
     if len(statements) != 1:
@@ -58,12 +61,18 @@ def validate(sql: str, allowed_tables: set[str]) -> tuple[str, list[str]]:
         name = table.name
         if not table.db and name in cte_names:
             continue
-        if table.catalog or (table.db and table.db != settings.SCHEMA):
-            raise SqlRejected(f"Only the {settings.SCHEMA} schema can be queried.")
+        # ds.catalog is None on a two-level engine (Postgres, DuckDB): any catalog is then wrong.
+        # On a three-level engine (Trino) a matching catalog is fine, so only a *mismatched* one
+        # (or any catalog at all when there is none to match) is rejected.
+        if (table.catalog and table.catalog != ds.catalog) or (not ds.catalog and table.catalog) \
+                or (table.db and table.db != ds.schema):
+            raise SqlRejected(f"Only the {ds.schema} schema can be queried.")
         if name not in allowed_tables:
             raise SqlRejected(
                 f"Unknown table {name!r}. Available tables: {', '.join(sorted(allowed_tables))}.")
-        table.set("db", exp.to_identifier(settings.SCHEMA))
+        table.set("db", exp.to_identifier(ds.schema))
+        if ds.catalog:
+            table.set("catalog", exp.to_identifier(ds.catalog))
         used.append(name)
 
     limit = tree.args.get("limit")
@@ -71,4 +80,4 @@ def validate(sql: str, allowed_tables: set[str]) -> tuple[str, list[str]]:
     if n is None or not str(n).isdigit() or int(n) > settings.ROW_LIMIT:
         tree = tree.limit(settings.ROW_LIMIT)
 
-    return tree.sql(dialect="postgres"), sorted(set(used))
+    return tree.sql(dialect=ds.dialect), sorted(set(used))

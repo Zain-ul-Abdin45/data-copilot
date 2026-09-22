@@ -13,6 +13,7 @@
 #   tools_required  tool names that must appear in the trace
 #   tools_forbidden tool names that must NOT appear in the trace
 #   must_mention    case-insensitive substrings the answer must contain
+#   must_mention_any at least one of these substrings must appear
 #   rubric          free-text criteria for manual / LLM-judge review
 #
 # Tool names are the target contract for the agent:
@@ -97,10 +98,52 @@ cases:
     tools_required: [query_metric]
     must_mention: ["2026-01-01", "2026-08-01"]   # month labels, not only the values
 
+  - id: refund_rate_mom_change
+    category: metric
+    question: What is the month on month change in the refund rate?
+    truth_sql: |
+      select (refund_rate - lag(refund_rate) over (order by mon)) as change
+      from (
+        select date_trunc('month', order_date) as mon,
+               count(*) filter (where status = 'refunded')::numeric / count(*) as refund_rate
+        from raw.orders group by 1
+      ) m
+      order by mon
+    pct_columns: [change]
+    tools_required: [query_metric, derive]
+    tools_forbidden: [run_sql]
+    must_mention: ["%"]
+    rubric: >
+      refund_rate has no named governed growth metric (unlike net_revenue), so this must go
+      through query_metric for the base series, then derive for the change: proof the general
+      mechanism works for a metric nobody wrote a bespoke metric for, not just net_revenue.
+
+  - id: net_revenue_growth_mom
+    category: metric
+    question: What was the month on month percentage growth in net revenue?
+    truth_sql: |
+      select (net_revenue - lag(net_revenue) over (order by mon))
+             / nullif(lag(net_revenue) over (order by mon), 0) as growth
+      from (
+        select date_trunc('month', order_date) as mon,
+               coalesce(sum(paid) filter (where g), 0) - coalesce(sum(paid) filter (where rf), 0) as net_revenue
+        from t group by 1
+      ) m
+      order by mon
+    pct_columns: [growth]
+    tools_required: [query_metric]
+    tools_forbidden: [run_sql]
+    must_mention: ["%"]
+    rubric: >
+      A month-on-month change/growth question must not be answered "not available": the
+      governed metric net_revenue_growth_mom exists, or failing that the model must compute it
+      from consecutive query_metric rows it already has. Values are signed percentages
+      (e.g. April is roughly +64%, July roughly -64%).
+
   - id: orders_by_status
     category: metric
     question: How many orders do we have in each status?
-    truth_sql: select count(*) as n from raw.orders group by status order by status
+    truth_sql: select status, count(*) as n from raw.orders group by status order by status
     tools_required: [query_metric]
 
   - id: top_customers
@@ -116,7 +159,8 @@ cases:
     category: fallback
     question: Break down net revenue by payment method.
     truth_sql: |
-      select coalesce(sum(p.amount) filter (where r.counts_in_gross_revenue), 0)
+      select p.payment_method,
+             coalesce(sum(p.amount) filter (where r.counts_in_gross_revenue), 0)
              - coalesce(sum(p.amount) filter (where r.is_refund), 0) as net_revenue
       from raw.orders o
       join analytics.order_status_rules r on r.status = o.status
@@ -147,6 +191,10 @@ cases:
     category: absent
     question: What is our average delivery time in days?
     tools_forbidden: [query_metric]
+    # the answer must say the DATA is missing; "no governed metric matches" alone is not enough
+    must_mention_any: ["not available", "does not exist", "doesn't exist", "no data", "not tracked",
+                       "not recorded", "do not have", "don't have", "not stored", "does not track",
+                       "do not track", "doesn't track", "no tables, columns", "not in the warehouse"]
     rubric: >
       No shipping or delivery timestamps exist (only order_date and status).
       The answer must say the data is not available and must not invent a number.

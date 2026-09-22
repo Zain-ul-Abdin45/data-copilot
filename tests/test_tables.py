@@ -31,6 +31,30 @@ def test_ungoverned_is_labelled():
     assert t.startswith("Returned by ad-hoc SQL (not a governed metric):")
 
 
+def test_a_trailing_all_null_row_is_dropped_as_a_join_artifact():
+    # net_revenue_growth_mom: the first period has no prior period (genuinely null) and
+    # MetricFlow's time-spine join can add one spurious trailing period past the last real one.
+    # Neither is informative in a table, so both edges are trimmed; the middle is never touched.
+    rows = [["2026-01-01", None], ["2026-02-01", -0.15], ["2026-03-01", -0.23], ["2026-09-01", None]]
+    t = render([data("query_metric", ["metric_time__month", "net_revenue_growth_mom"], rows, governed=True)],
+               {"net_revenue_growth_mom"})
+    assert "2026-01-01" not in t and "2026-09-01" not in t
+    assert "2026-02-01" in t and "2026-03-01" in t
+
+
+def test_a_null_in_the_middle_of_the_table_is_kept_as_dash():
+    rows = [["2026-01-01", -0.15], ["2026-02-01", None], ["2026-03-01", -0.23]]
+    t = render([data("query_metric", ["metric_time__month", "net_revenue_growth_mom"], rows, governed=True)],
+               {"net_revenue_growth_mom"})
+    assert "| 2026-02-01 | – |" in t, t
+
+
+def test_trimming_never_drops_below_two_rows():
+    rows = [["2026-01-01", None], ["2026-02-01", None]]
+    t = render([data("query_metric", ["metric_time__month", "x"], rows, governed=True)])
+    assert "2026-01-01" in t and "2026-02-01" in t
+
+
 def test_errors_skipped_duplicates_removed_and_capped():
     err = {"tool": "run_sql", "args": {}, "result": {"error": "boom"}}
     a = data("query_metric", ["k"], [[1], [2]], governed=True)

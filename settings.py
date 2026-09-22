@@ -6,6 +6,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 DBT_DIR = Path(os.getenv("DBT_PROJECT_DIR", ROOT.parent / "dbt-test-project"))
 
+# Which engine run_sql, the catalog and (via DBT_TARGET below) the governed path all point at.
+# Each is a separate dbt profile target in dbt-test-project/profiles.yml; see datasources/.
+DATASOURCE = os.getenv("COPILOT_DATASOURCE", "postgres")  # postgres | duckdb | trino
+DBT_TARGET = os.getenv("DBT_TARGET", DATASOURCE)
+
+# --- postgres (COPILOT_DATASOURCE=postgres) -----------------------------------------------
 # The agent only ever connects as a read-only role that can see the analytics
 # schema and nothing else (see the grants in the README).
 DB_HOST = os.getenv("COPILOT_DB_HOST", "localhost")
@@ -14,8 +20,32 @@ DB_USER = os.getenv("COPILOT_DB_USER", "copilot_ro")
 DB_PASSWORD = os.getenv("COPILOT_DB_PASSWORD", "copilot_ro")
 SCHEMA = "analytics"
 
+# --- duckdb (COPILOT_DATASOURCE=duckdb): a local file, no server, no login ------------------
+DUCKDB_PATH = os.getenv("COPILOT_DUCKDB_PATH", str(ROOT / "warehouse.duckdb"))
+DUCKDB_SCHEMA = os.getenv("COPILOT_DUCKDB_SCHEMA", "analytics")
+
+# --- trino (COPILOT_DATASOURCE=trino): UNVERIFIED, see datasources/trino.py ----------------
+TRINO_HOST = os.getenv("COPILOT_TRINO_HOST", "localhost")
+TRINO_PORT = int(os.getenv("COPILOT_TRINO_PORT", "8080"))
+TRINO_USER = os.getenv("COPILOT_TRINO_USER", "copilot_ro")
+TRINO_CATALOG = os.getenv("COPILOT_TRINO_CATALOG", "lodige")
+TRINO_SCHEMA = os.getenv("COPILOT_TRINO_SCHEMA", "analytics")
+
 ROW_LIMIT = 200
-STATEMENT_TIMEOUT_MS = 15_000
+STATEMENT_TIMEOUT_MS = 15_000  # postgres only; see datasources/duckdb_source.py's known gap
+
+# Personal data (email, name, ...) is masked out of every tool result before it reaches the
+# model or the interface. Off only makes sense on a warehouse with no personal data at all.
+MASK_PII = os.getenv("COPILOT_MASK_PII", "true").lower() == "true"
+
+# Whether the model may fall back to ad-hoc SQL at all. Off means only governed metrics and
+# catalog metadata are answerable; a question needing something no metric covers gets an
+# honest "cannot answer that" instead of arbitrary SQL. See agent.py and tools.py.
+ALLOW_RUN_SQL = os.getenv("COPILOT_ALLOW_RUN_SQL", "true").lower() == "true"
+
+# A shared bearer token for the /ask API (main.py). Empty (the default) means no auth, matching
+# the current "localhost only, no login" trust model; set it before exposing the API elsewhere.
+API_TOKEN = os.getenv("COPILOT_API_TOKEN", "")
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
 MODEL = os.getenv("COPILOT_MODEL", "qwen3:14b")

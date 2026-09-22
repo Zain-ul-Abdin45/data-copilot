@@ -6,7 +6,15 @@ pyyaml
 sqlglot
 psycopg[binary]
 
-# dbt + governed metrics (Postgres). Run `dbt parse` after editing semantic YAML.
+# dbt + governed metrics. Run `dbt parse` after editing semantic YAML.
 dbt-core>=1.12
-dbt-postgres>=1.11
+dbt-postgres>=1.11          # COPILOT_DATASOURCE=postgres (default)
 dbt-metricflow>=0.15
+
+# other data sources (datasources/): install only the one(s) you use
+# duckdb>=1.5 dbt-duckdb>=1.11             # COPILOT_DATASOURCE=duckdb — verified, see README
+# trino dbt-trino                          # COPILOT_DATASOURCE=trino — UNVERIFIED, see datasources/trino.py
+
+# interface (ui/): a self-hosted chat UI. Keep telemetry off (ui/.chainlit/config.toml)
+chainlit>=2.12
+plotly>=6

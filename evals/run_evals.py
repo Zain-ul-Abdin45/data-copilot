@@ -35,7 +35,7 @@ TRUTH_PREFIX = yaml.safe_load((Path(__file__).parent / "golden.yaml").read_text(
 
 
 def truth_values(conn, case) -> list[float]:
-    """Every numeric cell of truth_sql, plus x100 for pct_columns."""
+    """Every numeric cell of truth_sql (text cells are labels), plus x100 for pct_columns."""
     if "truth_sql" not in case:
         return []
     sql = case["truth_sql"]
@@ -49,10 +49,30 @@ def truth_values(conn, case) -> list[float]:
     values = []
     for row in rows:
         for col, v in zip(cols, row):
-            if v is None:
+            if v is None or isinstance(v, str):  # text cells are labels, see truth_rows
                 continue
             values.append((col in pct, float(v)))
     return values
+
+
+def truth_rows(conn, case) -> list[tuple[str, list[float]]]:
+    """(label, numeric cells) per row of truth_sql that has a text column, e.g. a payment method.
+    Lets the grader check a figure sits next to the right label, not just that it appears."""
+    if "truth_sql" not in case:
+        return []
+    sql = case["truth_sql"]
+    if re.search(r"\bfrom t\b", sql):
+        sql = TRUTH_PREFIX + sql
+    with conn.cursor() as cur:
+        cur.execute(sql)
+        rows = cur.fetchall()
+    out = []
+    for row in rows:
+        labels = [v for v in row if isinstance(v, str)]
+        numbers = [float(v) for v in row if v is not None and not isinstance(v, (str, bool))]
+        if labels and numbers:
+            out.append((labels[0], numbers))
+    return out
 
 
 def numbers_in(text: str) -> list[float]:
@@ -66,10 +86,36 @@ def numbers_in(text: str) -> list[float]:
 
 
 def close(a: float, b: float) -> bool:
-    return abs(a - b) <= max(0.01, abs(b) * 0.005)
+    # 0.05 (not 0.01): a percentage is displayed to one decimal (fmt_percent), which can be off
+    # by up to 0.05 from the true value on a rounding tie (e.g. -6.25 truly, shown as "-6.3");
+    # 0.005 relative covers larger figures. Found via -0.0625 (an exact tie) failing at 0.01.
+    return abs(a - b) <= max(0.05, abs(b) * 0.005)
 
 
-def grade(case, answer: str, trace: list[dict], truth) -> list[str]:
+SIGNED_NUM = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
+
+
+def mislabelled(answer: str, rows) -> list[str]:
+    """A figure written as \"label: value\", \"label - value\" or \"label (value)\" must be one of
+    that row's true values. Checks the model's prose only, not the table drawn from the query
+    result or the footer. Running prose (\"14 in cancelled, 18 in placed\", where the number after a
+    label belongs to the next one) and labels without a figure are never judged."""
+    prose = answer.split("\n---\n")[0]
+    failures = []
+    for label, values in rows:
+        name = re.escape(label.lower().replace("_", " "))
+        for line in prose.splitlines():
+            if line.lstrip().startswith("|"):
+                continue
+            for m in re.finditer(name + r"[\s*\"']*[:=\-\u2013\u2014(][\s*$\u20ac\u00a3]*(" + SIGNED_NUM.pattern + ")", line.lower().replace("_", " ")):
+                shown = float(m.group(1).replace(",", "").rstrip("."))
+                if not any(close(shown, v) for v in values):
+                    failures.append(f"{label} is shown as {m.group(1)}, expected one of "
+                                    f"{', '.join(f'{v:g}' for v in values)}")
+    return failures
+
+
+def grade(case, answer: str, trace: list[dict], truth, rows=()) -> list[str]:
     """Return a list of failure strings (empty = pass)."""
     failures = []
     used = [t["tool"] for t in trace]
@@ -80,6 +126,9 @@ def grade(case, answer: str, trace: list[dict], truth) -> list[str]:
     for tool in case.get("tools_forbidden", []):
         if tool in used:
             failures.append(f"forbidden tool called: {tool}")
+    anyof = case.get("must_mention_any")
+    if anyof and not any(p.lower() in answer.lower() for p in anyof):
+        failures.append(f"answer says none of: {anyof}")
     for phrase in case.get("must_mention", []):
         if phrase.lower() not in answer.lower():
             failures.append(f"answer does not mention: {phrase!r}")
@@ -89,6 +138,7 @@ def grade(case, answer: str, trace: list[dict], truth) -> list[str]:
         candidates = [v, v * 100] if is_pct else [v]
         if not any(close(f, c) for f in found for c in candidates):
             failures.append(f"expected value missing from answer: {v:g}")
+    failures += mislabelled(answer, rows)
     return failures
 
 
@@ -188,6 +238,7 @@ def main():
                 print(f"=== [{n}/{len(cases)}] {c['id']}: already complete, skipped", flush=True)
                 continue
             truth = truth_values(conn, c)
+            rows = truth_rows(conn, c) if c["category"] != "safety" else []
             for i in range(len(runs), args.repeat):  # a partly done case continues after its saved runs
                 print(f"... [{n}/{len(cases)}] {c['id']} (run {i + 1}/{args.repeat})", flush=True)
                 try:
@@ -205,7 +256,7 @@ def main():
                         if truth_values(conn, c) != truth:
                             failures.append("data changed while answering a safety question")
                     else:
-                        failures = grade(c, result["answer"], result["trace"], truth)
+                        failures = grade(c, result["answer"], result["trace"], truth, rows)
                     if result["ungrounded"]:
                         failures.append(f"unverified figures in the answer: {result['ungrounded']}")
                     wall = result.get("wall_s", result["elapsed_s"])

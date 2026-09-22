@@ -10,14 +10,18 @@ search later.
 """
 import re
 
-import db
+import datasources
 import dbtproject
-import settings
 
 _STOP = {"the", "and", "for", "are", "our", "how", "what", "which", "does", "have", "has", "with",
          "this", "that", "from", "much", "many", "any", "you", "your", "can", "was", "were", "who",
          "when", "where", "why", "use", "used", "using", "data", "track", "tracks", "tracked",
          "table", "column", "field", "about", "know", "tell", "show", "there"}
+
+# One wording for "the thing asked about is not in the warehouse", used by every engine's catalog
+NOT_FOUND_NOTE = ("Nothing in the warehouse (no table, column or metric) mentions: {terms}. If those "
+                  "words name what the user asked about, tell the user plainly that this data is not "
+                  "available in the warehouse. Do not answer with related metrics as if they covered it.")
 
 _cache: dict = {"key": None, "entries": None}
 
@@ -30,11 +34,19 @@ def _tokens(text: str) -> set[str]:
     return {_stem(w) for w in re.findall(r"[a-z0-9]+", text.lower())}
 
 
+def tokens(text: str) -> set[str]:
+    """Lower-cased word stems (payments -> payment) of any text."""
+    return _tokens(text)
+
+
+def content_terms(text: str) -> set[str]:
+    """The meaningful words of a question: stems, without short or filler words."""
+    return {t for t in _tokens(text) if len(t) > 2 and t not in _STOP}
+
+
 def relations() -> set[str]:
     """Tables and views the agent's role can query."""
-    _, rows = db.query("select table_name from information_schema.tables where table_schema = %s",
-                       (settings.SCHEMA,))
-    return {r[0] for r in rows}
+    return {table for table, _, _ in datasources.get().columns()}
 
 
 def _build() -> list[dict]:
@@ -51,6 +63,7 @@ def _build() -> list[dict]:
                 else node["resource_type"],
                 "description": node.get("description", ""),
                 "column_docs": {c: v.get("description", "") for c, v in node.get("columns", {}).items()},
+                "pii": {c for c, v in node.get("columns", {}).items() if (v.get("meta") or {}).get("pii")},
             }
 
     joins: dict[str, list[str]] = {}
@@ -64,24 +77,23 @@ def _build() -> list[dict]:
                 joins.setdefault(table, []).append(
                     f"{table}.{kw['column_name']} = {target.group(1)}.{kw['field']}")
 
-    cols, rows = db.query(
-        "select table_name, column_name, data_type from information_schema.columns "
-        "where table_schema = %s order by table_name, ordinal_position", (settings.SCHEMA,))
     columns: dict[str, list] = {}
-    for table, col, typ in rows:
+    for table, col, typ in datasources.get().columns():
         columns.setdefault(table, []).append((col, typ))
 
     entries = []
     for table, cols_ in columns.items():
         if table.startswith("metricflow_"):  # MetricFlow plumbing, not business data
             continue
-        d = docs.get(table, {"kind": "table", "layer": "", "description": "", "column_docs": {}})
+        d = docs.get(table, {"kind": "table", "layer": "", "description": "", "column_docs": {}, "pii": set()})
         entries.append({
             "name": table, "kind": d["kind"], "layer": d["layer"], "description": d["description"],
             "queryable_with_run_sql": True,
             **({"join_keys": joins[table]} if table in joins else {}),
-            "columns": [{"name": c, "type": t, **({"description": d["column_docs"][c]}
-                                                  if d["column_docs"].get(c) else {})}
+            "columns": [{"name": c, "type": t,
+                         **({"description": d["column_docs"][c]} if d["column_docs"].get(c) else {}),
+                         **({"pii": True, "note": "personal data: hidden in every tool result, not just here"}
+                            if c in d["pii"] else {})}
                         for c, t in cols_],
         })
     for m in semantic["metrics"]:
@@ -117,14 +129,12 @@ def search_catalog(query: str, limit: int = 6) -> dict:
     top = scored[:limit]
     matches = [{k: v for k, v in e.items() if not k.startswith("_")} for _, e in top]
     if not matches:
-        return {"matches": [], "note": "Nothing in the catalog matches, so this data does not "
-                                       "exist in the warehouse."}
+        return {"matches": [], "note": NOT_FOUND_NOTE.format(terms=", ".join(sorted(terms)) or "the question")}
     covered = set().union(*(terms & e["_tokens"] for _, e in top))
     result = {"matches": matches}
     if terms - covered:
         # e.g. "delivery" in "average delivery time": weak matches on the other words
         # must not be mistaken for the thing that was asked about
         result["terms_with_no_match"] = sorted(terms - covered)
-        result["note"] = ("Some words in the question match nothing in the catalog. If they name "
-                          "the thing being asked about, that data does not exist.")
+        result["note"] = NOT_FOUND_NOTE.format(terms=", ".join(result["terms_with_no_match"]))
     return result

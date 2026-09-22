@@ -7,6 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import datasources
 import settings
 
 TARGET = settings.DBT_DIR / "target"
@@ -25,8 +26,7 @@ def ensure_fresh() -> None:
             min(SEMANTIC_MANIFEST.stat().st_mtime, MANIFEST.stat().st_mtime) >= _newest_source():
         return
     dbt = Path(sys.executable).parent / "dbt"
-    env = {**os.environ, "PGUSER": settings.DB_USER, "PGPASSWORD": settings.DB_PASSWORD,
-           "PGHOST": settings.DB_HOST}
+    env = {**os.environ, "DBT_TARGET": settings.DBT_TARGET, **datasources.get().dbt_env()}
     proc = subprocess.run([str(dbt), "parse"], cwd=settings.DBT_DIR, env=env,
                           capture_output=True, text=True)
     if proc.returncode != 0:

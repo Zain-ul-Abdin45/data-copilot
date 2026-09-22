@@ -2,3 +2,11 @@
 __pycache__/
 logs/
 evals/results/
+ui/.chainlit/translations/
+ui/.files/
+ui/preview/
+History/
+HANDOFF.md
+warehouse.duckdb
+
+.DS_Store
