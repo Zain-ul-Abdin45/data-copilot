@@ -5,6 +5,7 @@ The model never gets to describe how a number was produced. The "How this was
 calculated" footer is built from the tool trace by code, so a governed metric
 and an ad-hoc SQL result are always labelled correctly, whatever the model says.
 """
+import ast
 import datetime as dt
 import json
 import time
@@ -18,6 +19,12 @@ from llm import chat
 from tools import TOOL_IMPLS, TOOL_SPECS
 
 MAX_STEPS = 8
+
+# The model-facing parameter names per tool, straight from TOOL_SPECS (never TOOL_IMPLS's own
+# signature: derive/search_catalog take extra injected arguments — trace, focus — that the model
+# must never see as something it could supply itself).
+_TOOL_PARAM_NAMES = {s["function"]["name"]: sorted(s["function"]["parameters"]["properties"])
+                     for s in TOOL_SPECS}
 
 _TOOLS_WITH_SQL = """Tools
 - describe_metrics(term): resolve a business word to a governed metric; returns its definition, \
@@ -100,14 +107,21 @@ Query again for anything new; figures from earlier answers may be repeated as th
 - Today is {today}."""
 
 
-def system_prompt() -> str:
+def system_prompt(focus_tables: set[str] | None = None) -> str:
     """Built fresh per call (not a module-level constant) so a settings change in a running
     process, e.g. in a test, is picked up without a restart."""
     with_sql = settings.ALLOW_RUN_SQL
-    return _SYSTEM_PROMPT_TEMPLATE.format(
+    prompt = _SYSTEM_PROMPT_TEMPLATE.format(
         tools=_TOOLS_WITH_SQL if with_sql else _TOOLS_NO_SQL,
         step_2=_STEP_2_WITH_SQL if with_sql else _STEP_2_NO_SQL,
         today=dt.date.today().isoformat())
+    if focus_tables:
+        # A UI-selected focus: a preference for search_catalog's ranking, never a restriction
+        # (run_sql may still reach elsewhere; the database role is the actual boundary).
+        prompt += ("\n\nThe user has focused this conversation on: " + ", ".join(sorted(focus_tables)) +
+                  ". Prefer these for search_catalog and run_sql when they can answer the question; "
+                  "you may still look elsewhere if they cannot, but say so.")
+    return prompt
 
 
 def _visible(result: dict) -> dict:
@@ -185,10 +199,84 @@ def _finish(text: str, trace: list[dict], bad: list[str], think: bool, step_limi
             "footer_md": footer, "ratio_metrics": sorted(ratio)}
 
 
-def _run(question: str, think: bool, history: list[dict] | None = None) -> dict:
-    """`history`: earlier turns as [{"question": ..., "answer": ...}], oldest first."""
+def _recover_leaked_tool_call(content: str) -> list[dict] | None:
+    """Some models occasionally emit a tool call as plain JSON text in the message body instead
+    of a structured tool_calls entry (seen live: llama3.1, mid-conversation, after already using
+    tools correctly earlier in the same run) — the loop would otherwise end the turn treating
+    stray JSON as if it were the final prose answer. Live, the JSON was not the whole content: it
+    was a real partial answer followed by a trailing JSON blob ("Gross revenue is 22,633.57.\\n\\n
+    {\"name\": ...}"), so this scans backwards from the end for the shortest trailing substring
+    that parses as one JSON object, rather than requiring content to be JSON from the first
+    character. Ordinary prose (which will not parse as JSON no matter where the scan starts) can
+    never be misread as a tool call; a well-formed trailing object naming something other than a
+    known tool is left alone rather than guessed at."""
+    text = content.strip()
+    if not text.endswith("}"):
+        return None
+    start = text.rfind("{")
+    while start != -1:
+        try:
+            obj = json.loads(text[start:])
+        except json.JSONDecodeError:
+            start = text.rfind("{", 0, start)
+            continue
+        name = obj.get("name")
+        args = obj.get("parameters") or obj.get("arguments") or {}
+        if name in TOOL_IMPLS and isinstance(args, dict):
+            return [{"function": {"name": name, "arguments": args}}]
+        return None  # a well-formed trailing object, but not a tool-call shape recognised here
+    return None
+
+
+def _coerce_stringified_lists(args: dict) -> dict:
+    """Some models (llama3.1 via Ollama, at least) fill an array-typed tool argument with a
+    STRING containing a list literal instead of a real JSON array, e.g. {"metrics":
+    "['net_revenue']"} instead of {"metrics": ["net_revenue"]}. list("['net_revenue']") does not
+    raise — it silently splits the string into individual characters — so this surfaced as a
+    mystifying "no such metric" error from MetricFlow rather than a clear argument problem. Only
+    top-level string values shaped like [...] are touched; anything else is passed through as-is."""
+    fixed = {}
+    for k, v in args.items():
+        if isinstance(v, str) and v.strip().startswith("[") and v.strip().endswith("]"):
+            try:
+                parsed = json.loads(v)
+            except json.JSONDecodeError:
+                try:
+                    parsed = ast.literal_eval(v)
+                except (ValueError, SyntaxError):
+                    parsed = v
+            fixed[k] = parsed if isinstance(parsed, list) else v
+        else:
+            fixed[k] = v
+    return fixed
+
+
+_METRIC_ARG_ALIASES = ("metric", "metric_name", "metric_names")
+
+
+def _coerce_metric_arg(name: str, args: dict) -> dict:
+    """query_metric's own tool name is singular ("query_metric") but its parameter is plural
+    ("metrics") — a real naming mismatch that invites exactly the wrong guess. Seen from a real
+    model (llama3.1): 'metric' and 'metric_name' in place of 'metrics', repeated across retries
+    without self-correcting even after the tool rejected each one by name. Renames the alias only
+    when 'metrics' itself was not already given, and wraps a bare string into a single-item list
+    (another guess seen from the same model)."""
+    if name != "query_metric" or "metrics" in args:
+        return args
+    for alias in _METRIC_ARG_ALIASES:
+        if alias in args:
+            value = args.pop(alias)
+            args["metrics"] = value if isinstance(value, list) else [value]
+            break
+    return args
+
+
+def _run(question: str, think: bool, history: list[dict] | None = None,
+          focus_tables: set[str] | None = None) -> dict:
+    """`history`: earlier turns as [{"question": ..., "answer": ...}], oldest first.
+    `focus_tables`: a UI-selected soft scope, see system_prompt() and tool_search_catalog()."""
     history = history or []
-    messages = [{"role": "system", "content": system_prompt()}]
+    messages = [{"role": "system", "content": system_prompt(focus_tables)}]
     for turn in history:
         messages += [{"role": "user", "content": turn["question"]},
                      {"role": "assistant", "content": turn["answer"]}]
@@ -202,7 +290,7 @@ def _run(question: str, think: bool, history: list[dict] | None = None) -> dict:
         message = chat(messages, tools=TOOL_SPECS, think=think)
         messages.append(message)
 
-        tool_calls = message.get("tool_calls")
+        tool_calls = message.get("tool_calls") or _recover_leaked_tool_call(message.get("content", ""))
         if not tool_calls:
             text = message.get("content", "")
             bad = grounding.ungrounded(text, context, trace)
@@ -224,17 +312,31 @@ def _run(question: str, think: bool, history: list[dict] | None = None) -> dict:
                     args = json.loads(args)
                 except json.JSONDecodeError:
                     args = {}
+            if isinstance(args, dict):
+                args = _coerce_metric_arg(name, _coerce_stringified_lists(args))
 
             impl = TOOL_IMPLS.get(name)
             if impl is None:
                 result = {"error": f"Unknown tool {name!r}. Available: {', '.join(TOOL_IMPLS)}."}
             else:
                 try:
-                    # derive reads the trace to find the result to transform; not a model-supplied
-                    # argument (TOOL_SPECS never exposes it), so it is injected here instead.
-                    result = impl(**args, trace=trace) if name == "derive" else impl(**args)
+                    # derive reads the trace, search_catalog reads the UI's focus selection:
+                    # neither is a model-supplied argument (TOOL_SPECS never exposes them), so
+                    # both are injected here instead.
+                    if name == "derive":
+                        result = impl(**args, trace=trace)
+                    elif name == "search_catalog":
+                        result = impl(**args, focus=focus_tables)
+                    else:
+                        result = impl(**args)
                 except TypeError as e:  # wrong or missing argument names
-                    result = {"error": f"Bad arguments for {name}: {e}"}
+                    # naming the offending argument is not enough for a model to converge on the
+                    # right one (seen live: llama3.1 guessed "metric", then "metric_name", neither
+                    # named in the error) — so the actual valid names are given too, every time
+                    result = {"error": f"Bad arguments for {name}: {e}."}
+                    valid = _TOOL_PARAM_NAMES.get(name)
+                    if valid:
+                        result["hint"] = f"{name}'s parameters are exactly: {', '.join(valid)}."
                 except Exception as e:
                     result = {"error": f"{name} failed: {' '.join(str(e).split())[:300]}"}
 
@@ -260,13 +362,15 @@ def escalation_reason(run: dict) -> str:
     return ""
 
 
-def ask(question: str, history: list[dict] | None = None) -> dict:
+def ask(question: str, history: list[dict] | None = None, focus_tables: set[str] | None = None) -> dict:
+    """`focus_tables`: table names the interface's scope selector has enabled (see ui/app.py);
+    a soft preference, not a restriction (see system_prompt/tool_search_catalog)."""
     started, started_wall = time.monotonic(), time.time()  # monotonic excludes Mac sleep
-    out = _run(question, think=settings.THINK, history=history)
+    out = _run(question, think=settings.THINK, history=history, focus_tables=focus_tables)
     out["escalated"] = False
     reason = escalation_reason(out) if settings.ESCALATE and not settings.THINK else ""
     if reason:
-        out = _run(question, think=True, history=history)
+        out = _run(question, think=True, history=history, focus_tables=focus_tables)
         out.update(escalated=True, escalation_reason=reason)
     out["elapsed_s"] = round(time.monotonic() - started, 1)  # awake time
     out["wall_s"] = round(time.time() - started_wall, 1)      # includes any sleep

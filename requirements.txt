@@ -13,7 +13,7 @@ dbt-metricflow>=0.15
 
 # other data sources (datasources/): install only the one(s) you use
 # duckdb>=1.5 dbt-duckdb>=1.11             # COPILOT_DATASOURCE=duckdb — verified, see README
-# trino dbt-trino                          # COPILOT_DATASOURCE=trino — UNVERIFIED, see datasources/trino.py
+# trino dbt-trino                          # COPILOT_DATASOURCE=trino — verified, see README / trino/
 
 # interface (ui/): a self-hosted chat UI. Keep telemetry off (ui/.chainlit/config.toml)
 chainlit>=2.12

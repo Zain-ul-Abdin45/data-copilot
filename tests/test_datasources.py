@@ -41,7 +41,7 @@ def test_jsonable_covers_the_types_a_driver_can_hand_back():
 
 def test_duckdb_is_two_level_like_postgres():
     with _with(_Fake("duckdb", "analytics")):
-        out, used = validate("select * from fct_orders limit 5000", TABLES)
+        out, used, _ = validate("select * from fct_orders limit 5000", TABLES)
         assert "analytics.fct_orders" in out and out.endswith("LIMIT 200"), out
         assert used == ["fct_orders"]
         try:
@@ -52,15 +52,15 @@ def test_duckdb_is_two_level_like_postgres():
 
 
 def test_trino_qualifies_with_catalog_and_accepts_a_matching_one():
-    with _with(_Fake("trino", "analytics", catalog="lodige")):
-        out, _ = validate("select * from fct_orders", TABLES)
-        assert "lodige.analytics.fct_orders" in out, out
-        out2, _ = validate("select * from lodige.analytics.fct_orders", TABLES)  # already qualified
-        assert "lodige.analytics.fct_orders" in out2
+    with _with(_Fake("trino", "analytics", catalog="warehouse")):
+        out, _, _ = validate("select * from fct_orders", TABLES)
+        assert "warehouse.analytics.fct_orders" in out, out
+        out2, _, _ = validate("select * from warehouse.analytics.fct_orders", TABLES)  # already qualified
+        assert "warehouse.analytics.fct_orders" in out2
 
 
 def test_trino_rejects_a_different_catalog():
-    with _with(_Fake("trino", "analytics", catalog="lodige")):
+    with _with(_Fake("trino", "analytics", catalog="warehouse")):
         try:
             validate("select * from other_catalog.analytics.fct_orders", TABLES)
             raise AssertionError("a mismatched catalog must be rejected")
@@ -82,5 +82,5 @@ def test_default_qualify_is_schema_dot_table_trino_is_three_level():
     assert _Fake("postgres", "analytics").qualify("glossary") == "analytics.glossary"
     from datasources.trino import TrinoDataSource
     ds = TrinoDataSource.__new__(TrinoDataSource)  # skip __init__, only qualify() is under test
-    ds.schema, ds.catalog = "analytics", "lodige"
-    assert ds.qualify("glossary") == "lodige.analytics.glossary"
+    ds.schema, ds.catalog = "analytics", "warehouse"
+    assert ds.qualify("glossary") == "warehouse.analytics.glossary"

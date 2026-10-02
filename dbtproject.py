@@ -22,8 +22,23 @@ def _newest_source() -> float:
 
 
 def ensure_fresh() -> None:
-    if SEMANTIC_MANIFEST.exists() and MANIFEST.exists() and \
-            min(SEMANTIC_MANIFEST.stat().st_mtime, MANIFEST.stat().st_mtime) >= _newest_source():
+    """Re-parses when a model/YAML file is newer than the compiled manifest, OR when the
+    manifest was built for a different engine: COPILOT_DATASOURCE switched since the last dbt
+    parse, with no model file touched to trip the mtime check above, so target/ still holds a
+    manifest compiled for the PREVIOUS engine's SQL dialect and catalog. Hit live: switching
+    from trino back to postgres without an explicit dbt command reused a trino-compiled
+    manifest, and MetricFlow then generated SQL referencing a catalog postgres doesn't have
+    ("cross-database references are not implemented"). dbt's own manifest.json already records
+    which adapter built it (metadata.adapter_type, one of dbt's own plugin names — the same
+    strings as settings.DATASOURCE), so this needs no new state of its own."""
+    fresh = SEMANTIC_MANIFEST.exists() and MANIFEST.exists() and \
+        min(SEMANTIC_MANIFEST.stat().st_mtime, MANIFEST.stat().st_mtime) >= _newest_source()
+    if fresh:
+        try:
+            fresh = json.loads(MANIFEST.read_text())["metadata"]["adapter_type"] == settings.DATASOURCE
+        except Exception:
+            fresh = False
+    if fresh:
         return
     dbt = Path(sys.executable).parent / "dbt"
     env = {**os.environ, "DBT_TARGET": settings.DBT_TARGET, **datasources.get().dbt_env()}

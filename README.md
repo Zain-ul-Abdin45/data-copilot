@@ -1,7 +1,9 @@
 # Data Copilot
 
 A self-hosted assistant for questions about a warehouse — Postgres, a local DuckDB file, or
-(unverified) Trino. It answers from governed metrics first and says so when it cannot.
+Trino. It answers from governed metrics first and says so when it cannot.
+
+![A question answered from a governed metric: badge, table, the "How this was calculated" panel with the tool trace and SQL, and a chart — all from one real run of the interface (COPILOT_UI_STUB=1, no model needed to reproduce this exact screen).](docs/screenshot.png)
 
 ```
 question ─► Qwen3 (Ollama) ─► describe_metrics ─┐
@@ -74,10 +76,10 @@ via `datasources/`) always point at the same warehouse. Adding an engine means o
 
 | | Postgres | DuckDB | Trino |
 |---|---|---|---|
-| Status | measured (the golden set) | verified (dbt build + a real model run below) | **unverified** — no cluster in dev |
+| Status | measured (the golden set) | verified (dbt build + a real model run below) | verified (real cluster, below) |
 | Set with | `COPILOT_DATASOURCE=postgres` (default) | `COPILOT_DATASOURCE=duckdb` | `COPILOT_DATASOURCE=trino` |
-| Read-only guarantee | role + read-only session + sqlguard | sqlguard only (see `datasources/duckdb_source.py`) | sqlguard only |
-| Needs | — | `pip install duckdb dbt-duckdb` | `pip install trino dbt-trino`, real cluster |
+| Read-only guarantee | role + read-only session + sqlguard | sqlguard only (see `datasources/duckdb_source.py`) | sqlguard only, plus whatever the connector's own credentials enforce |
+| Needs | — | `pip install duckdb dbt-duckdb` | `pip install trino dbt-trino`, a cluster (`trino/docker-compose.yml` below) |
 
 DuckDB, tried end to end on this project's data:
 
@@ -91,24 +93,59 @@ COPILOT_DATASOURCE=duckdb DBT_TARGET=duckdb .venv/bin/python agent.py "What is o
 # -> 20,486.14 — identical to the Postgres answer, same model, same question
 ```
 
-Trino (`datasources/trino.py`) is written against the documented client and Trino's
-ANSI `information_schema`, but nothing in this environment can run it against a real cluster
-(no Docker either). Treat it as a starting point, not a tested integration; the module's
-docstring says exactly what to check first.
+Trino, tried end to end against a real (local, throwaway) cluster — no raw.* copy needed this
+time: Trino's own `postgresql` connector reads the *existing* Postgres `analytics` schema
+directly, through the same read-only `copilot_ro` role, so there is nothing separate to build:
+
+```
+cd trino && docker compose up -d                     # trinodb/trino + a postgresql connector
+                                                      # catalog ("warehouse") pointed at copilot_ro
+cd ../dbt-test-project
+DBT_TARGET=trino COPILOT_TRINO_HOST=localhost COPILOT_TRINO_PORT=8080 \
+  COPILOT_TRINO_USER=copilot_ro COPILOT_TRINO_CATALOG=warehouse COPILOT_TRINO_SCHEMA=analytics \
+  ../data-copilot/.venv/bin/dbt parse
+cd ../data-copilot
+COPILOT_DATASOURCE=trino DBT_TARGET=trino COPILOT_TRINO_HOST=localhost COPILOT_TRINO_PORT=8080 \
+  COPILOT_TRINO_USER=copilot_ro COPILOT_TRINO_CATALOG=warehouse COPILOT_TRINO_SCHEMA=analytics \
+  .venv/bin/python evals/oracle.py --engine metricflow
+# -> 18 ok, 0 expected gaps, 0 failed — including top-N with a real ORDER BY (Wren's gap) and
+#    net_revenue = 480,561.16, identical to the Postgres answer, same model, same question
+```
+
+Verifying this surfaced a real bug, now fixed: `dbtproject.ensure_fresh()` only checked file
+mtimes, so switching `COPILOT_DATASOURCE` with no model file touched (trino, then back to
+postgres) silently reused a manifest compiled for the *previous* engine's SQL dialect —
+MetricFlow then generated SQL referencing a catalog the current engine doesn't have
+("cross-database references are not implemented"). It now also checks the compiled manifest's
+own `metadata.adapter_type` against the active engine (see `dbtproject.py`).
 
 ## Privacy
 
-Masking (above) is name-based: it looks at each result column's bare name (after a MetricFlow
-`entity__` prefix or a `table.` qualifier is stripped) against the columns dbt marks `pii: true`,
-not at where the data actually came from. `SELECT email AS contact` defeats it, the same class
-of gap as `search_catalog` being keyword-based rather than a promise. It covers the two paths
-that exist today (`query_metric`'s dimensions, `run_sql`'s SELECT list); it is a safety net for
-the common case, not a guarantee against a determined query. See `privacy.py`.
+Masking (above) looks at each result column's bare name (after a MetricFlow `entity__` prefix or
+a `table.` qualifier is stripped) against the columns dbt marks `pii: true`. For `query_metric`'s
+dimensions that is already exact, since MetricFlow names them directly. For `run_sql`,
+`sqlguard.validate` additionally resolves every output column back to its real source column
+with sqlglot's own lineage graph (`sqlglot.lineage.lineage`, no schema, no extra database call),
+so `SELECT email AS contact` — and the same rename one level removed, through a CTE — no longer
+defeats it; `privacy.mask_rows` masks on whichever source column fed the output, not on what the
+query chose to call it. What's left: a bare `SELECT *` has nothing for lineage to name (the real
+column names come back from the database unchanged, so bare-name masking already covers it), and
+a `UNION`/`INTERSECT` isn't traced (each branch would need its own lineage) — both fall back to
+the original bare-name check, never less safe than before this existed, just not improved for
+those two shapes. It covers the two paths that exist today (`query_metric`'s dimensions,
+`run_sql`'s SELECT list); it is a strong safety net now, not a guarantee against every
+determined query — the database role remains the actual trust boundary. See `privacy.py` and
+`sqlguard.py`.
 
 ## Run it
 
+Needs: Python 3.11+, a local Postgres server, [Ollama](https://ollama.com), and the
+`dbt-test-project` sibling directory (business rules, dbt models, the semantic layer — see
+**Known limits** for where that currently lives).
+
 ```
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
+cp .env.example .env && set -a && source .env && set +a   # or just export the ones you need
 createdb data_copilot && psql -d data_copilot -f setup_db.sql
 .venv/bin/python seed_db.py                       # raw tables
 cd ../dbt-test-project && ../data-copilot/.venv/bin/dbt seed && \
@@ -119,10 +156,21 @@ ollama pull qwen3:14b
 .venv/bin/uvicorn main:app                          # POST /ask {"question": "..."}
 ```
 
-Settings are environment variables (see `settings.py`): `COPILOT_MODEL`, `COPILOT_THINK`,
-`COPILOT_DB_*`, `DBT_PROJECT_DIR`, `COPILOT_DATASOURCE`/`DBT_TARGET` (see **Data sources**),
-`COPILOT_MASK_PII`, `COPILOT_ALLOW_RUN_SQL`, `COPILOT_API_TOKEN` (a bearer token for `/ask`;
-empty, the default, means no auth — the current localhost-only trust model).
+Every setting above is an environment variable — `.env.example` lists all of them, grouped the
+same way as **Data sources**, **Privacy** and **Interface** below, with the default for each.
+`COPILOT_DATASOURCE`/`DBT_TARGET` switches the whole stack to DuckDB or Trino instead (see
+**Data sources**); everything else (`COPILOT_MODEL`, `COPILOT_MASK_PII`, `COPILOT_ALLOW_RUN_SQL`,
+`COPILOT_API_TOKEN`, …) is read the same way regardless of which engine is active.
+
+`seed_db.py`'s synthetic warehouse is deliberately not clean: 300 customers, 3,000 orders over
+the same Jan-Aug 2026 window, a bounded skew in orders per customer (most buy once or twice, a
+few are repeat or loyal, capped 8:1 so no one customer can dominate — an earlier, unbounded
+attempt gave one customer 70% of all orders, a data error worth designing against, not a feature),
+~3% of customers with no email on file, and a few percent of orders with zero or two payment
+records (a failed sync, a split payment) — both already handled correctly by the existing
+`coalesce(sum(...), 0)` in the truth queries and the dbt measures, so this exercises that rather
+than requiring a change to it. Real, if synthetic: closer to what Phase 4's actual data will look
+like than the first 25-customer, 120-order version this was measured on.
 
 ## Interface
 
@@ -134,9 +182,12 @@ python ui/preview.py && open ui/preview/charts.html    # the charts on real data
 
 A chat with follow-ups ("and by month?"). Each answer shows a badge (**Governed metric**, **Ad-hoc SQL: not a
 governed metric**, or **From the data catalog**), the model's words, the table drawn from the returned rows, a
-chart drawn from the same rows, warnings for unverified figures, and a **How this was calculated** side panel
-(definitions, every tool call, refusals, the SQL). The layout logic is in `ui/render.py` (plain Python, tested
-without a browser); `ui/app.py` is a thin Chainlit wrapper.
+chart drawn from the same rows, warnings for unverified figures, and a **How this was calculated** panel
+(definitions, every tool call, refusals, the SQL), shown inline under the answer, not as a Chainlit "side"
+element — a side element on every message was found to share, and take over, the same panel as the persistent
+table-focus sidebar (below), making it vanish right after chat start instead of staying reachable for the rest
+of the conversation. The layout logic is in `ui/render.py` (plain Python, tested without a browser); `ui/app.py`
+is a thin Chainlit wrapper.
 
 - **Charts** follow the dataviz rules: a line for a trend, bars for categories, at most three series, one axis
   (a rate and an amount get separate charts), a legend only for two or more series, one label at the end or the
@@ -153,6 +204,37 @@ without a browser); `ui/app.py` is a thin Chainlit wrapper.
   `ui/.chainlit/config.toml`. Both palettes pass the validator; light aqua is 2.74:1 on the surface, which is why a
   table always accompanies a chart.
 - Rounding is half up everywhere (6.25% shows as 6.3%), so the table agrees with how people round.
+- **A table focus selector** lives in a persistent sidebar (Chainlit's `ElementSidebar`, a custom React
+  tree at `ui/public/elements/TableFocus.jsx`), not a settings-drawer modal — a schema, grouped into
+  Facts/Dimensions/Staging/Reference by dbt naming convention (`ui/app.py`'s `grouped_tables`; the agent's
+  role only exposes one real SQL schema, so this grouping stands in for the schema level a multi-schema
+  warehouse would show), each table a checkbox. Checking one calls back into the Python session
+  (`@cl.action_callback("set_focus_tables")`) rather than waiting for a settings form to be saved.
+  It is a soft preference, not a restriction: `search_catalog` only lets a focused
+  table break a *tie* with an equally good match, never outrank a genuinely better one (`catalog.py`'s
+  `_ranked`), and the model is told what is focused but may still look elsewhere if nothing in scope answers.
+  Focusing a table also reaches the governed metrics built on it (focusing out `fct_orders` deprioritizes
+  `net_revenue`, `refund_rate`, ... in favour of `avg_customer_lifetime_orders`, the one metric built on
+  `dim_customers` instead), resolved from the dbt manifest's measures and derived/ratio metric
+  references (`catalog._metric_tables`), not a list kept by hand. `run_sql` is not restricted by it — the
+  database role remains the actual security boundary (see **Privacy**'s masking for the same distinction).
+  Text only throughout, no icons/emoji — a decorative pass at this (per-group icons, arrow glyphs) was
+  found to make the panel less clear, not more, and was reverted in favour of plain words and literal
+  `[-]`/`[+]`. The panel is guaranteed reachable from the very first screen, before anything is typed:
+  `on_chat_start` also sends a plain-text welcome message with a "Tables" button, since the sidebar
+  itself arrives after an async round-trip and was found, live, to be genuinely absent from the first
+  paint. That round-trip is now a single database query (`catalog.table_columns()`), not three — an
+  earlier version queried the same information three separate times per chat start, ~3s of dead air
+  before anything appeared; confirmed live over the socket protocol at 0.03s after the fix.
+- **Per-column metadata** ("(i)" next to a column, once its table's "show columns" is expanded): fetched
+  on click, not upfront for every column of every table, via `catalog.column_info` — a fill rate (%
+  non-null) and a small sample of real values. A column marked `pii: true` never returns sample values
+  through this path either, only the fill rate (a count, not content); confirmed live, not only unit
+  tested. The fetch is backend-initiated (`CustomElement.update()`, called from
+  `@cl.action_callback("column_info")`), a different code path from the checkbox tree's own
+  frontend-initiated `updateElement()` — both were verified end-to-end over the real socket
+  protocol and the `/project/action` HTTP endpoint a `CustomElement`'s `callAction` actually uses,
+  not assumed to work from the shape of the API alone.
 
 ## Changing business rules
 
@@ -173,7 +255,21 @@ It runs, in order: the stubbed unit tests, the agent role's database scope (read
 analytics, cannot write, cannot see `raw`), Ollama and model presence, consistency of
 `golden.yaml` (every truth query runs), the night scripts, dbt tests, the glossary, an
 **oracle run** for each engine, a crash-resilience test of the eval runner, and the interface (started with the
-stub agent, then driven over its socket like a browser: two turns, charts, side panel, no errors, history carried).
+stub agent, then driven over its socket like a browser: two turns, charts, calculation panel, no errors, history
+carried).
+
+**CI** (`.github/workflows/tests.yml`) runs just the stubbed unit tests (`python tests/run_light.py`)
+on every push — no Postgres, no Ollama, no real dbt project. `dbtproject.load` reads
+`target/manifest.json`/`semantic_manifest.json` as plain JSON files, with no dbt process
+involved unless they're stale; CI points `DBT_PROJECT_DIR` at `tests/fixtures/dbt_target`, a
+frozen copy of those two files trimmed to what `catalog.py`/`privacy.py`/`semantic.py` actually
+read (dbt-test-project itself is a separate, unversioned sibling project, so it can't be CI's
+source — see the handoff notes). One test calls `describe_metrics` with nothing stubbed, which
+goes through the real MetricFlow engine and needs a full local dbt project (profiles.yml, a real
+`dbt parse`), not just those two files; `COPILOT_LIGHT_TESTS_NO_LIVE_ENGINE=1` skips exactly that
+one in CI, and `tests/run_light.py` says why. A local run with the real dbt-test-project is
+unaffected either way and runs every test as before.
+carried).
 
 The oracle is a scripted "perfect model" driving the real agent loop, the real tools
 and the real grader. If it passes, a night-run failure is the model's behaviour, not a
@@ -225,6 +321,11 @@ tables and fast-first escalation, so they need re-measuring (`sh evals/night.sh`
 
 ## Known limits
 
+- **`dbt-test-project` is not in this repository.** It's a separate, unversioned sibling
+  directory this project was developed alongside (business rules, dbt models,
+  `semantic_layer.yml`'s metric definitions — everything **Business rules**, **Changing business
+  rules** and **Run it** above point at). Cloning just this repo is not enough to run it end to
+  end yet; see the project board / open an issue if you're hitting this as an outside contributor.
 - The grounding check finds invented figures. It cannot tell whether allowed
   arithmetic is meaningful (a share of the wrong two numbers passes).
 - Small prompt or description changes can flip whether the 14B model adds a `group_by` nobody asked for (it did on
@@ -232,12 +333,26 @@ tables and fast-first escalation, so they need re-measuring (`sh evals/night.sh`
   single-number cases (`-k refund_rate`, `-k open_discount`, `-k gross_vs_net`).
 - The model can add filters nobody asked for (such as a date range). The footer
   always shows the filters that were applied.
-- `search_catalog` is keyword-based; it is small enough not to need embeddings yet.
-- Personal data is masked by column name (see **Privacy**), which is a real mitigation but not
-  a guarantee: an aliased column (`SELECT email AS contact`) is not recognised. A closed-vocabulary,
-  aggregate-only path — the separate dataveil package — would close this properly; not integrated yet.
+- `search_catalog` is keyword-based by default; it is small enough not to need embeddings yet.
+  `COPILOT_CATALOG_EMBEDDINGS=true` (needs `ollama pull nomic-embed-text`, already used nowhere
+  else) turns on a cosine-similarity re-rank **among entries keyword overlap already matched** —
+  e.g. "refund percentage" now ranks `refund_rate` above `refunded_revenue` instead of tying.
+  It deliberately cannot pull in a zero-keyword-overlap entry: a raw cosine similarity was
+  measured, live, against this catalog's real entries, and an unrelated query ("weather forecast
+  tomorrow") scored *higher* against one real entry than a genuinely relevant query scored
+  against its best match — too thin a margin, on a catalog this small, to trust for deciding
+  whether something matches at all without weakening `NOT_FOUND_NOTE`'s "not available" guarantee,
+  which depends on keyword overlap being the gate. See `catalog._ranked`'s docstring.
+- Personal data is masked by column name (see **Privacy**); `run_sql`'s aliased case
+  (`SELECT email AS contact`) is now caught via sqlglot lineage, not just a plain name match, but
+  it is still not a sandbox: a `UNION` or a bare `SELECT *`'s own masking stays name-based. A
+  closed-vocabulary, aggregate-only path — the separate dataveil package — remains the stronger
+  guarantee; not integrated yet.
 - DuckDB's read-only guarantee is weaker than Postgres's: sqlguard only, no session-level enforcement
-  (see `datasources/duckdb_source.py`). Trino is unverified — no cluster in this environment.
+  (see `datasources/duckdb_source.py`). Trino's read-only guarantee is also sqlguard plus whatever
+  its connector's own credentials enforce (`trino/catalog/warehouse.properties` uses the same
+  `copilot_ro` role as the direct Postgres path) — Trino itself has no concept of "read-only
+  session" the way a Postgres session does.
 - `COPILOT_ALLOW_RUN_SQL`/`COPILOT_MASK_PII`/`COPILOT_API_TOKEN`/the UI login are read once, at
   process start (like `COPILOT_DATASOURCE`); changing them means restarting the process, not a
   live toggle.
@@ -245,3 +360,27 @@ tables and fast-first escalation, so they need re-measuring (`sh evals/night.sh`
   from query_metric's own time group_by (chronological by default) or an ORDER BY the model wrote
   into run_sql, wrong if some future caller passes unordered rows. It does not re-sort, so it does
   not have to guess which column is "time" for a breakdown that is not a time series at all.
+- A time dimension that is not the canonical `metric_time` (e.g. `order__order_date`,
+  `customer__first_order_date`) used to be offered bare, defaulting to day grain with no ordering
+  guarantee — a trend question over months of daily rows, capped by `ROW_LIMIT`, was found live to
+  produce a fabricated "steadily increasing" narrative from an incomplete, unordered table.
+  `semantic._group_by_options` now offers every time dimension with the same grain-choice template
+  as `metric_time`, and `query_metric`'s auto-ordering matches any name ending in a grain suffix,
+  not just ones literally starting `metric_time`. A capped result also now carries a `note`
+  steering towards a coarser grain, as a second line of defense.
+- **Tool-call robustness**: some models don't reliably match a tool's declared argument schema.
+  Live against `llama3.1:latest` (not seen from `qwen3:14b`), three distinct failure shapes turned
+  up and are now defended against in `agent.py`, all with unit tests reproducing the exact
+  live failure: an array-typed argument filled with a stringified list instead of a real one
+  (`"metrics": "['net_revenue']"`, which `list(...)` on a string would otherwise silently split
+  into characters rather than raise — `_coerce_stringified_lists`); the singular/plural mismatch
+  invited by `query_metric`'s own name (`metric`/`metric_name` guessed in place of `metrics`,
+  unconverged across retries even after each guess was rejected by name — `_coerce_metric_arg`);
+  and a tool call emitted as raw JSON text in the message body instead of a structured tool call,
+  sometimes trailing real prose rather than replacing it entirely (`_recover_leaked_tool_call`).
+  Separately, a `TypeError` from a bad argument now names the tool's actual valid parameters
+  (from `TOOL_SPECS`, never an injected argument like `trace`/`focus`), not just what was wrong —
+  naming the mistake alone was not enough for a model to converge on the fix. None of this makes
+  a weaker model as reliable as a stronger one at composing a correct multi-part final answer
+  from several tool results (a real, separate limitation, not a format bug); it only removes the
+  protocol-level noise so an eval run measures that, not JSON-serialization luck.

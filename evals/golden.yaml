@@ -7,14 +7,19 @@
 # the expected values with it.
 #
 # Fields
-#   category        metric | fallback | lookup | absent | open_ended | safety
-#   truth_sql       single query; every numeric cell must appear in the answer
-#   pct_columns     truth columns that may also be reported as a percentage
-#   tools_required  tool names that must appear in the trace
-#   tools_forbidden tool names that must NOT appear in the trace
-#   must_mention    case-insensitive substrings the answer must contain
+#   category         metric | fallback | lookup | absent | open_ended | safety | adversarial
+#   question         a single question, OR:
+#   turns            [q1, q2, ...] for a multi-turn case (question is omitted); only the FINAL
+#                     turn's answer is graded, with history built the way the UI does — see
+#                     evals/stress.yaml for the follow-up-question regression class this exists for
+#   truth_sql        single query; every numeric cell must appear in the answer
+#   pct_columns      truth columns that may also be reported as a percentage
+#   tools_required   tool names that must appear in the trace (all turns combined, if `turns`)
+#   tools_forbidden  tool names that must NOT appear in the trace
+#   must_mention     case-insensitive substrings the answer must contain
 #   must_mention_any at least one of these substrings must appear
-#   rubric          free-text criteria for manual / LLM-judge review
+#   must_not_mention case-insensitive substrings the answer must NOT contain (e.g. a wrong refusal)
+#   rubric           free-text criteria for manual / LLM-judge review
 #
 # Tool names are the target contract for the agent:
 #   describe_metrics, query_metric  (governed, MetricFlow)
@@ -140,6 +145,22 @@ cases:
       from consecutive query_metric rows it already has. Values are signed percentages
       (e.g. April is roughly +64%, July roughly -64%).
 
+  - id: avg_orders_per_customer
+    category: metric
+    question: On average, how many orders does each customer place?
+    truth_sql: |
+      select avg(n) from (
+        select c.id, count(o.id) as n from raw.customers c
+        left join raw.orders o on o.customer_id = c.id
+        group by c.id
+      ) x
+    tools_required: [query_metric]
+    tools_forbidden: [run_sql]
+    rubric: >
+      avg_customer_lifetime_orders is built on dim_customers, not fct_orders — the first
+      governed metric that is, and proof metric-level focus (catalog._metric_tables) has two
+      different tables to actually differentiate between, not just one.
+
   - id: orders_by_status
     category: metric
     question: How many orders do we have in each status?
@@ -170,7 +191,14 @@ cases:
     must_mention: [not a governed metric]
     rubric: >
       payment_method is not a dimension of any semantic model, so the answer
-      must come from run_sql and be explicitly labelled ungoverned.
+      must come from run_sql and be explicitly labelled ungoverned. Two distinct real SQL
+      mistakes have been seen here on different models, both worth checking for specifically:
+      (1) summing stg_payments.amount with no order_status_rules join at all (silently reports
+      gross revenue as "net"), and (2) joining fct_orders to stg_payments (one order can have
+      TWO payment rows — ~5% of orders are split payments) and summing order_total per matched
+      row instead of amount, double-counting the order_total half of every split-payment order.
+      The truth_sql's join order (orders -> payments, sum(p.amount)) is the correct shape;
+      sum(o.order_total) after joining to payments is the tell for mistake (2).
 
   # ---- metadata questions: no numbers, no SQL ------------------------------
   - id: lookup_payment_methods

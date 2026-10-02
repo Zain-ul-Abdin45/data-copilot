@@ -59,6 +59,31 @@ def test_ollama_readiness_messages():
             assert "not reachable" in llm.ready()
 
 
+def fake_embed(vectors):
+    class R:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"embeddings": vectors}
+    return R()
+
+
+def test_embed_returns_vectors_for_the_whole_batch_in_one_call():
+    with mock.patch.object(llm.httpx, "post", return_value=fake_embed([[0.1, 0.2], [0.3, 0.4]])) as post:
+        assert llm.embed(["a", "b"]) == [[0.1, 0.2], [0.3, 0.4]]
+        assert post.call_count == 1  # one request for the batch, not one per text
+
+
+def test_embed_returns_none_when_unreachable_rather_than_raising():
+    with mock.patch.object(llm.httpx, "post", side_effect=ConnectionError("refused")):
+        assert llm.embed(["a"]) is None
+
+
+def test_embed_of_nothing_is_a_no_op():
+    assert llm.embed([]) == []
+
+
 def report(name, passed, failures=()):
     run = {"failures": list(failures), "elapsed_s": 12.0, "escalated": False, "answer": "ans", "tools": []}
     return {"agent": name, "model": "m", "think": False, "escalate": True, "repeat": 1,
@@ -151,6 +176,47 @@ def test_running_prose_and_tables_and_footers_are_not_judged():
     footer = "Fine.\n\n---\nHow this was calculated\n- Query: `where status = 'cancelled': 99`"
     assert run_evals.mislabelled(footer, rows) == []
     assert run_evals.mislabelled("Cancelled orders are the fewest.", rows) == []  # label without a figure
+
+
+def test_must_not_mention_catches_a_wrong_refusal():
+    # the original reported bug: a correct answer would still fail here if it also hedged
+    # with the wrong-refusal phrasing, which is exactly what this exists to catch
+    case = {"must_not_mention": ["not available", "does not exist"]}
+    assert run_evals.grade(case, "March saw a 26.9% jump.", [], []) == []
+    failures = run_evals.grade(case, "That figure is not available from the warehouse.", [], [])
+    assert failures == ["answer wrongly mentions: 'not available'"], failures
+
+
+def fake_multi_turn_ask(question, history=None, focus_tables=None):
+    """A minimal stand-in shaped like agent.ask(): each call's trace/ungrounded/elapsed_s are
+    distinguishable so run_turns's concatenation-vs-final-answer split can be checked."""
+    turn = len(history or []) + 1
+    return {"answer": f"turn {turn} answer", "llm_answer": f"turn {turn} answer",
+            "trace": [{"tool": f"tool_{turn}", "args": {}, "result": {"rows": [[1]], "row_count": 1}}],
+            "ungrounded": [f"bad_{turn}"] if turn == 1 else [], "elapsed_s": 1.5, "wall_s": 1.5,
+            "escalated": turn == 2, "think": False, "step_limit": False}
+
+
+def test_run_turns_grades_only_the_final_answer_but_combines_trace_and_time():
+    result = run_evals.run_turns(fake_multi_turn_ask, ["first question", "second question"])
+    assert result["answer"] == "turn 2 answer"  # only the last turn is what a real user reads
+    assert [t["tool"] for t in result["trace"]] == ["tool_1", "tool_2"]  # both turns' tools visible
+    assert result["ungrounded"] == ["bad_1"]  # an earlier turn's bad figure must still be caught
+    assert result["elapsed_s"] == 3.0 and result["wall_s"] == 3.0  # summed, not just the last turn
+    assert result["escalated"] is True  # escalated on any turn, not only the last
+
+
+def test_run_turns_builds_history_the_way_the_ui_does():
+    seen_history = []
+
+    def recording_ask(question, history=None, focus_tables=None):
+        seen_history.append(list(history or []))
+        return {"answer": question, "llm_answer": f"echo: {question}", "trace": [], "ungrounded": [],
+                "elapsed_s": 0.1, "wall_s": 0.1, "escalated": False, "think": False, "step_limit": False}
+
+    run_evals.run_turns(recording_ask, ["q1", "q2", "q3"])
+    assert seen_history == [[], [{"question": "q1", "answer": "echo: q1"}],
+                             [{"question": "q1", "answer": "echo: q1"}, {"question": "q2", "answer": "echo: q2"}]]
 
 
 def test_close_tolerates_a_percentage_rounding_tie_but_not_a_wrong_figure():

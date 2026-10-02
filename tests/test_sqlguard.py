@@ -55,12 +55,50 @@ def test_rejected():
 
 
 def test_limit_is_capped_and_schema_qualified():
-    out, _ = validate("select * from fct_orders limit 100000", TABLES)
+    out, _, _ = validate("select * from fct_orders limit 100000", TABLES)
     assert out.endswith("LIMIT 200") and "analytics.fct_orders" in out
-    out, _ = validate("select * from fct_orders limit 5", TABLES)
+    out, _, _ = validate("select * from fct_orders limit 5", TABLES)
     assert out.endswith("LIMIT 5")
-    out, _ = validate("select * from fct_orders", TABLES)
+    out, _, _ = validate("select * from fct_orders", TABLES)
     assert out.endswith("LIMIT 200")
+
+
+def test_lineage_resolves_a_plain_column_to_itself():
+    _, _, lineage = validate("select status, credit_limit from fct_orders", TABLES)
+    assert lineage["status"] == {"status"}
+    assert lineage["credit_limit"] == {"credit_limit"}
+
+
+def test_lineage_resolves_an_alias_to_its_real_source_column():
+    # the exact gap privacy.py's docstring used to flag as open: SELECT x AS y must not hide x.
+    _, _, lineage = validate("select status as s from fct_orders", TABLES)
+    assert lineage["s"] == {"status"}
+
+
+def test_lineage_resolves_through_a_join_by_qualified_name():
+    _, _, lineage = validate(
+        "select c.customer_id as cid from fct_orders o join dim_customers c "
+        "on c.customer_id = o.customer_id", TABLES)
+    assert lineage["cid"] == {"customer_id"}
+
+
+def test_lineage_resolves_through_a_cte():
+    # the same alias gap, one layer removed: a model routing the rename through a CTE instead
+    # of the top-level SELECT must not escape lineage either.
+    _, _, lineage = validate(
+        "with a as (select status as contact from fct_orders) select contact from a", TABLES)
+    assert lineage["contact"] == {"status"}
+
+
+def test_lineage_is_none_for_a_set_operation():
+    _, _, lineage = validate(
+        "select status from fct_orders union select status from fct_orders", TABLES)
+    assert lineage is None
+
+
+def test_lineage_omits_an_unresolvable_star_column():
+    _, _, lineage = validate("select * from fct_orders", TABLES)
+    assert lineage == {}
 
 
 if __name__ == "__main__":

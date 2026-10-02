@@ -1,7 +1,9 @@
 """The guard against meaningless groupings, derived from the real semantic manifest.
 No LLM, no database (it only reads target/semantic_manifest.json)."""
 import sys
+import types
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -62,6 +64,65 @@ def test_a_time_grouping_is_chronological_unless_another_order_was_asked_for():
     assert list(_asked(group_by=["metric_time__month"], order_by=["-net_revenue"]).order_by_names or []) == ["-net_revenue"]
     assert not _asked(group_by=["order__status"]).order_by_names
     assert not _asked().order_by_names
+
+
+def test_an_entity_qualified_time_grouping_is_also_chronological():
+    # found via a stress-test run: a trend question grouped by order__order_date__month (not the
+    # canonical metric_time__month) came back in arbitrary order because only names literally
+    # starting "metric_time" were auto-ordered; a model reading it as chronological then narrated
+    # a fabricated "steadily increasing" trend out of shuffled monthly rows
+    assert list(_asked(group_by=["order__order_date__month"]).order_by_names or []) == ["order__order_date__month"]
+    assert list(_asked(group_by=["customer__first_order_date__week"]).order_by_names or []) == \
+        ["customer__first_order_date__week"]
+    assert not _asked(group_by=["order__status"]).order_by_names  # a non-time dimension is untouched
+
+
+class _FakeDim:
+    def __init__(self, dunder_name, kind):
+        self.dunder_name = dunder_name
+        self.type = types.SimpleNamespace(value=kind)
+
+
+class _FakeMetric:
+    def __init__(self, name, dimensions):
+        self.name = name
+        self.dimensions = dimensions
+
+
+def test_group_by_options_offers_a_grain_choice_for_every_time_dimension_not_just_metric_time():
+    # the actual bug: order__order_date was offered bare (implicit day grain, and query_metric
+    # only auto-orders a name ending in a grain suffix), sitting right next to metric_time's
+    # properly-templated "metric_time__day|week|month|quarter|year" — a model reaching for "the
+    # order date" got day grain with no ordering guarantee instead of ever being nudged to __month
+    m = _FakeMetric("refund_rate", [
+        _FakeDim("order__order_date", "time"),
+        _FakeDim("customer__first_order_date", "time"),
+        _FakeDim("order__status", "categorical"),
+        _FakeDim("metric_time__day", "time"),
+    ])
+    with mock.patch.object(semantic, "defining_dimensions", return_value=set()):
+        options = semantic._group_by_options(m)
+    assert "order__order_date" not in options  # never offered bare
+    assert "order__order_date__day|week|month|quarter|year" in options
+    assert "customer__first_order_date__day|week|month|quarter|year" in options
+    assert "order__status" in options  # a categorical dimension is untouched
+    assert options[-1] == "metric_time__day|week|month|quarter|year"  # still listed, still last
+
+
+def test_a_capped_result_carries_a_note_steering_towards_a_coarser_grain():
+    fake = _FakeEngine()
+    fake_rows = [(f"2026-01-{i:02d}", 1.0) for i in range(1, 4)]  # 3 rows, well under the cap
+    fake.query = lambda request: types.SimpleNamespace(
+        result_df=types.SimpleNamespace(rows=fake_rows, column_names=("metric_time__day", "net_revenue")),
+        sql="SELECT 1")
+    with mock.patch.object(semantic, "_engine", return_value=fake), \
+            mock.patch.object(semantic.settings, "ROW_LIMIT", 3):  # cap set to exactly the row count
+        capped = semantic.query_metric(["net_revenue"], group_by=["metric_time__day"])
+    assert "capped at 3 rows" in capped["note"] and "coarser time grain" in capped["note"]
+    with mock.patch.object(semantic, "_engine", return_value=fake), \
+            mock.patch.object(semantic.settings, "ROW_LIMIT", 10):  # under the cap: no note
+        uncapped = semantic.query_metric(["net_revenue"], group_by=["metric_time__day"])
+    assert "note" not in uncapped
 
 
 def test_metrics_named_after_the_asked_word_outrank_ones_that_only_mention_it():

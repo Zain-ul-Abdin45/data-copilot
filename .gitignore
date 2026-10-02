@@ -1,12 +1,21 @@
 .venv/
 __pycache__/
+*.pyc
 logs/
 evals/results/
+# a stray default config chainlit writes to the CWD if ever run from the repo root instead of
+# ui/ (the real one is ui/.chainlit/config.toml, intentionally tracked; only its translations/
+# below is ignored, since chainlit redownloads those itself)
+/.chainlit/
 ui/.chainlit/translations/
 ui/.files/
 ui/preview/
 History/
 HANDOFF.md
 warehouse.duckdb
+.env
+.pytest_cache/
+.vscode/
+.idea/
 
 .DS_Store

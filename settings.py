@@ -24,11 +24,11 @@ SCHEMA = "analytics"
 DUCKDB_PATH = os.getenv("COPILOT_DUCKDB_PATH", str(ROOT / "warehouse.duckdb"))
 DUCKDB_SCHEMA = os.getenv("COPILOT_DUCKDB_SCHEMA", "analytics")
 
-# --- trino (COPILOT_DATASOURCE=trino): UNVERIFIED, see datasources/trino.py ----------------
+# --- trino (COPILOT_DATASOURCE=trino): verified against a real cluster, see README / trino/ --
 TRINO_HOST = os.getenv("COPILOT_TRINO_HOST", "localhost")
 TRINO_PORT = int(os.getenv("COPILOT_TRINO_PORT", "8080"))
 TRINO_USER = os.getenv("COPILOT_TRINO_USER", "copilot_ro")
-TRINO_CATALOG = os.getenv("COPILOT_TRINO_CATALOG", "lodige")
+TRINO_CATALOG = os.getenv("COPILOT_TRINO_CATALOG", "warehouse")
 TRINO_SCHEMA = os.getenv("COPILOT_TRINO_SCHEMA", "analytics")
 
 ROW_LIMIT = 200
@@ -49,6 +49,12 @@ API_TOKEN = os.getenv("COPILOT_API_TOKEN", "")
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434/api/chat")
 MODEL = os.getenv("COPILOT_MODEL", "qwen3:14b")
+EMBED_MODEL = os.getenv("COPILOT_EMBED_MODEL", "nomic-embed-text")
+# search_catalog's keyword overlap alone decides WHICH entries match at all; this only re-ranks
+# among entries that already matched (see catalog._ranked). A raw cosine threshold was tried and
+# measured, live, not to separate an unrelated query from a real one cleanly enough on a catalog
+# this small to trust it for deciding a match on its own — see catalog.py's docstring.
+CATALOG_EMBEDDINGS = os.getenv("COPILOT_CATALOG_EMBEDDINGS", "false").lower() == "true"
 # Fast first: thinking is off by default (~15 s/question). Answers that used ad-hoc SQL, ended
 # in an error, or contain unverified figures are re-run once with thinking on (~3 min).
 THINK = os.getenv("COPILOT_THINK", "false").lower() == "true"

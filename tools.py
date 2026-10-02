@@ -14,11 +14,14 @@ import sqlguard
 from catalog import relations, search_catalog
 
 
-def _mask(result: dict) -> dict:
-    """Applied to every result that carries rows, from whichever tool produced them."""
+def _mask(result: dict, column_lineage: dict[str, set[str]] | None = None) -> dict:
+    """Applied to every result that carries rows, from whichever tool produced them.
+    `column_lineage` (run_sql only, from sqlguard.validate) lets masking see through a
+    SELECT-list alias; every other path has nothing of that kind to pass."""
     if "rows" not in result:
         return result
-    rows, masked_cols = privacy.mask_rows(result["columns"], result["rows"], settings.MASK_PII)
+    rows, masked_cols = privacy.mask_rows(result["columns"], result["rows"], settings.MASK_PII,
+                                          column_lineage)
     result["rows"] = rows
     if masked_cols:
         result["masked_columns"] = masked_cols
@@ -39,8 +42,10 @@ def tool_query_metric(metrics: list[str], group_by: list[str] | None = None,
     return _mask(semantic.query_metric(metrics, group_by, filters, start_date, end_date, order_by, limit))
 
 
-def tool_search_catalog(query: str) -> dict:
-    return search_catalog(query)
+def tool_search_catalog(query: str, focus: set[str] | None = None) -> dict:
+    """`focus` (table names the UI has the user scoped to) is supplied by the agent loop from
+    session state, not the model: it is not part of the tool's public parameters (TOOL_SPECS)."""
+    return search_catalog(query, focus=focus)
 
 
 def tool_derive(operation: str, columns: list[str] | None = None, trace: list[dict] | None = None) -> dict:
@@ -65,7 +70,7 @@ def tool_run_sql(sql: str) -> dict:
                          "if neither covers this question, say plainly that it cannot be "
                          "answered from what is available, without guessing at numbers."}
     try:
-        safe_sql, tables = sqlguard.validate(sql, relations())
+        safe_sql, tables, column_lineage = sqlguard.validate(sql, relations())
     except sqlguard.SqlRejected as e:
         return {"error": str(e)}
     try:
@@ -79,7 +84,7 @@ def tool_run_sql(sql: str) -> dict:
                 "columns_of_tables_used": known,
                 "hint": "Fix the query using these real column names and call run_sql again."}
     return _mask({"governed": False, "columns": cols, "rows": rows, "row_count": len(rows),
-                  "_sql": safe_sql, "_tables": tables})
+                  "_sql": safe_sql, "_tables": tables}, column_lineage)
 
 
 TOOL_SPECS = [

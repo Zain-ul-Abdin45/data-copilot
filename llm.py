@@ -35,6 +35,23 @@ def chat(messages: list[dict], tools: list[dict] | None = None,
     return message
 
 
+def embed(texts: list[str]) -> list[list[float]] | None:
+    """Embedding vectors for `texts` via Ollama's /api/embed (settings.EMBED_MODEL), one call
+    for the whole batch. None if the server or model isn't reachable; callers (catalog.py) must
+    treat that the same as the feature being off, never let it break a search that keyword
+    matching alone would have answered."""
+    if not texts:
+        return []
+    base = settings.OLLAMA_URL.rsplit("/api/", 1)[0]
+    try:
+        resp = httpx.post(f"{base}/api/embed", json={"model": settings.EMBED_MODEL, "input": texts},
+                          timeout=30)
+        resp.raise_for_status()
+        return resp.json()["embeddings"]
+    except Exception:
+        return None
+
+
 def ready() -> str | None:
     """None if the Ollama server is up and the configured model is installed, else the
     reason. Only lists installed models; it does not load or run anything."""

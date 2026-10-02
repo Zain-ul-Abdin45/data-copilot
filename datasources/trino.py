@@ -1,12 +1,14 @@
 """A Trino cluster as the warehouse — the other half of Path B's data-lake step (querying
 Parquet/Iceberg on S3/HDFS through a federated engine rather than a single DuckDB file).
 
-UNVERIFIED: written against the documented `trino` Python client and Trino's ANSI
-information_schema, but there is no Trino cluster in this development environment (no Docker
-either) to run it against. Before relying on this in production: run it against a real cluster,
-confirm `settings.TRINO_CATALOG`'s connector actually exposes `information_schema.columns`
-(most do), and add a Trino case to `evals/oracle.py`. Needs the `trino` package
-(`pip install trino`) and, for the governed path, the `dbt-trino` adapter.
+Verified against a real (local, throwaway) cluster: `trino/docker-compose.yml` in the repo
+root runs `trinodb/trino` with a `postgresql` connector catalog pointed at this project's own
+Postgres database through the same read-only `copilot_ro` role — see README's **Data sources**
+for the exact commands. `evals/oracle.py --engine metricflow` passed all 18 cases through it
+with zero failures and zero expected gaps, including top-N with a real ORDER BY (the one thing
+the Wren bake-off engine could not do) and a `net_revenue` identical to the direct-Postgres
+answer. Needs the `trino` package (`pip install trino`) and, for the governed path, the
+`dbt-trino` adapter.
 """
 import settings
 from datasources.base import DataSource, jsonable

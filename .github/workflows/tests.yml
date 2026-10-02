@@ -1,0 +1,24 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  fast:
+    # The stubbed suite only: no Postgres, no Ollama, no real dbt project. dbt-test-project is a
+    # separate, unversioned sibling project (see HANDOFF notes) — tests/fixtures/dbt_target is a
+    # frozen copy of its manifest.json/semantic_manifest.json, just enough for dbtproject.load's
+    # callers (catalog.py, privacy.py, semantic.py's defining_dimensions). One test still needs
+    # the real MetricFlow engine end to end and is skipped here; see tests/run_light.py.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: python tests/run_light.py
+        env:
+          DBT_PROJECT_DIR: ${{ github.workspace }}/tests/fixtures/dbt_target
+          COPILOT_LIGHT_TESTS_NO_LIVE_ENGINE: "1"

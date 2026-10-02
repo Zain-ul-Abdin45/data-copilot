@@ -142,6 +142,7 @@ def test_derive_receives_the_trace_but_the_model_cannot_supply_it():
             mock.patch.object(agent, "chat", lambda messages, tools=None, think=None: script.pop(0)), \
             mock.patch.object(agent, "TOOL_IMPLS", impls), \
             mock.patch.object(agent.semantic, "ratio_metric_names", lambda: set()), \
+            mock.patch.object(agent.semantic, "metric_summary", lambda name: name), \
             mock.patch.object(settings, "AUDIT_PATH", Path(d) / "a.jsonl"), \
             mock.patch.object(settings, "THINK", False), mock.patch.object(settings, "ESCALATE", False):
         out = agent.ask("and month on month?")
@@ -167,3 +168,167 @@ def test_a_change_in_an_already_percentage_column_renders_as_percentage_points()
                       "rows": [["2026-01-01", 0.0], ["2026-02-01", 100.0]]}}]
     with mock.patch.object(agent.semantic, "ratio_metric_names", lambda: {"refund_rate"}):
         assert agent._ratio_metrics(plain_trace) == {"refund_rate"}
+
+
+def test_focus_tables_are_injected_into_search_catalog_and_named_in_the_prompt():
+    seen_kwargs = {}
+
+    def fake_search(**kw):
+        seen_kwargs.update(kw)
+        return {"matches": []}
+
+    script = [call("search_catalog", query="revenue"), say("Not found.")]
+    impls = {"search_catalog": fake_search}
+    seen_messages = []
+
+    def fake_chat(messages, tools=None, think=None):
+        seen_messages.append(messages[0]["content"])
+        return script.pop(0)
+
+    with tempfile.TemporaryDirectory() as d, \
+            mock.patch.object(agent, "chat", fake_chat), \
+            mock.patch.object(agent, "TOOL_IMPLS", impls), \
+            mock.patch.object(agent.semantic, "ratio_metric_names", lambda: set()), \
+            mock.patch.object(settings, "AUDIT_PATH", Path(d) / "a.jsonl"), \
+            mock.patch.object(settings, "THINK", False), mock.patch.object(settings, "ESCALATE", False):
+        agent.ask("what about revenue?", focus_tables={"fct_orders"})
+    assert seen_kwargs == {"query": "revenue", "focus": {"fct_orders"}}
+    assert "focused this conversation on: fct_orders" in seen_messages[0]
+
+
+def test_a_stringified_list_argument_is_coerced_before_reaching_the_tool():
+    # found via a real llama3.1 run: it filled an array-typed argument with a STRING containing a
+    # list literal ("['net_revenue']") instead of a real JSON array. list("['net_revenue']") does
+    # not raise, it silently produces individual characters, so this must be caught before the
+    # tool ever sees it, not left to surface as a mystifying "no such metric" error downstream.
+    seen_kwargs = {}
+
+    def fake_query_metric(**kw):
+        seen_kwargs.update(kw)
+        return dict(MONTHS)
+
+    script = [call("query_metric", metrics="['net_revenue']", group_by="['metric_time__month']"),
+             say("Here it is.")]
+    impls = {"query_metric": fake_query_metric}
+    with tempfile.TemporaryDirectory() as d, \
+            mock.patch.object(agent, "chat", lambda messages, tools=None, think=None: script.pop(0)), \
+            mock.patch.object(agent, "TOOL_IMPLS", impls), \
+            mock.patch.object(agent.semantic, "ratio_metric_names", lambda: set()), \
+            mock.patch.object(agent.semantic, "metric_summary", lambda name: name), \
+            mock.patch.object(settings, "AUDIT_PATH", Path(d) / "a.jsonl"), \
+            mock.patch.object(settings, "THINK", False), mock.patch.object(settings, "ESCALATE", False):
+        agent.ask("net revenue by month?")
+    assert seen_kwargs == {"metrics": ["net_revenue"], "group_by": ["metric_time__month"]}
+
+
+def test_a_leaked_tool_call_in_plain_content_is_recovered_not_treated_as_the_final_answer():
+    # the exact shape seen live from llama3.1, mid-conversation, after tools had already worked once
+    leaked = '{"name": "describe_metrics", "parameters": {"term":"refund"}}'
+    assert agent._recover_leaked_tool_call(leaked) == \
+        [{"function": {"name": "describe_metrics", "arguments": {"term": "refund"}}}]
+    assert agent._recover_leaked_tool_call('  ' + leaked + '  ') is not None  # surrounding whitespace
+    assert agent._recover_leaked_tool_call('{"name": "describe_metrics", "arguments": {"term": "x"}}') is not None
+    # the actual live shape: real prose, THEN a trailing leaked call — not JSON from character one
+    mixed = 'The gross revenue taken is $542,965.95.\n\n' + leaked
+    assert agent._recover_leaked_tool_call(mixed) == \
+        [{"function": {"name": "describe_metrics", "arguments": {"term": "refund"}}}]
+
+
+def test_ordinary_prose_is_never_mistaken_for_a_leaked_tool_call():
+    for text in ("Net revenue was $480,561.16.", "", "{not valid json", "{}",
+                 '{"name": "delete_everything", "parameters": {}}',  # a real JSON object, unknown tool
+                 '{"name": "run_sql", "parameters": "not a dict"}',  # args not a dict
+                 "The set {1, 2, 3} was used to compute this."):  # a brace pair that is not JSON at all
+        assert agent._recover_leaked_tool_call(text) is None, text
+
+
+def test_a_tool_call_leaked_into_content_actually_runs_instead_of_ending_the_turn():
+    # reproduces the live gross_vs_net failure: query_metric succeeds once, then the model's
+    # SECOND tool call arrives as raw JSON in content instead of a proper tool_calls entry — the
+    # turn must not end there with only half the answer
+    leaked_call = say('{"name": "describe_metrics", "parameters": {"term": "refund"}}')
+    script = [call("query_metric", metrics=["gross_revenue"]), leaked_call,
+             say("Gross revenue was 22,633.57; refunded_revenue is the amount refunded.")]
+    impls = {"query_metric": lambda **kw: dict(GROSS),
+             "describe_metrics": lambda term=None: {"metrics": [{"name": "refunded_revenue"}]}}
+    with tempfile.TemporaryDirectory() as d, \
+            mock.patch.object(agent, "chat", lambda messages, tools=None, think=None: script.pop(0)), \
+            mock.patch.object(agent, "TOOL_IMPLS", impls), \
+            mock.patch.object(agent.semantic, "ratio_metric_names", lambda: set()), \
+            mock.patch.object(agent.semantic, "metric_summary", lambda name: name), \
+            mock.patch.object(settings, "AUDIT_PATH", Path(d) / "a.jsonl"), \
+            mock.patch.object(settings, "THINK", False), mock.patch.object(settings, "ESCALATE", False):
+        out = agent.ask("gross revenue and refunds?")
+    assert [t["tool"] for t in out["trace"]] == ["query_metric", "describe_metrics"]
+    assert out["llm_answer"] == "Gross revenue was 22,633.57; refunded_revenue is the amount refunded."
+
+
+def test_a_singular_metric_argument_is_renamed_to_the_plural_the_tool_expects():
+    # found live: llama3.1 called query_metric with "metric" then "metric_name" instead of the
+    # actual parameter "metrics", neither named in query_metric()'s own function name
+    assert agent._coerce_metric_arg("query_metric", {"metric": "net_revenue"}) == {"metrics": ["net_revenue"]}
+    assert agent._coerce_metric_arg("query_metric", {"metric_name": ["net_revenue"]}) == {"metrics": ["net_revenue"]}
+    # "metrics" already given: never overwritten by a stray alias also present
+    assert agent._coerce_metric_arg("query_metric", {"metrics": ["a"], "metric": "b"}) == {"metrics": ["a"], "metric": "b"}
+    # only query_metric is touched: another tool's own "metric"-shaped argument is left alone
+    assert agent._coerce_metric_arg("describe_metrics", {"metric": "x"}) == {"metric": "x"}
+
+
+def test_a_bad_argument_error_names_the_real_parameters_so_a_model_can_actually_correct_itself():
+    # a wrong argument name outside _coerce_metric_arg's aliases (so the TypeError path itself,
+    # not the alias shortcut, is what's under test here) must come back naming what IS valid, not
+    # just what was wrong — that is the actual fix: a model told only "topic is wrong" has nothing
+    # to converge on, but told "the parameters are exactly: term" does
+    script = [call("describe_metrics", topic="refunds"), say("Done.")]
+    impls = {"describe_metrics": lambda term=None: {"metrics": []}}  # a real signature, so an
+    # unexpected kwarg actually raises TypeError instead of being silently absorbed by **kw
+    with tempfile.TemporaryDirectory() as d, \
+            mock.patch.object(agent, "chat", lambda messages, tools=None, think=None: script.pop(0)), \
+            mock.patch.object(agent, "TOOL_IMPLS", impls), \
+            mock.patch.object(agent.semantic, "ratio_metric_names", lambda: set()), \
+            mock.patch.object(settings, "AUDIT_PATH", Path(d) / "a.jsonl"), \
+            mock.patch.object(settings, "THINK", False), mock.patch.object(settings, "ESCALATE", False):
+        out = agent.ask("what is a refund?")
+    err = out["trace"][0]["result"]
+    assert "topic" in err["error"] and "Bad arguments" in err["error"]
+    assert err["hint"] == "describe_metrics's parameters are exactly: term."
+
+
+def test_bad_arguments_hint_lists_the_tools_own_parameter_names():
+    # exercised directly: agent._TOOL_PARAM_NAMES is built from TOOL_SPECS, not TOOL_IMPLS, so an
+    # injected argument (trace, focus) never appears as something the model could pass itself
+    assert agent._TOOL_PARAM_NAMES["query_metric"] == \
+        sorted(["metrics", "group_by", "filters", "start_date", "end_date", "order_by", "limit"])
+    assert "trace" not in agent._TOOL_PARAM_NAMES["derive"] and "operation" in agent._TOOL_PARAM_NAMES["derive"]
+    assert "focus" not in agent._TOOL_PARAM_NAMES["search_catalog"]
+
+
+def test_coerce_stringified_lists_leaves_ordinary_arguments_alone():
+    args = {"metrics": ["net_revenue"], "term": "net revenue", "limit": 3, "sql": "select 1",
+            "filters": [{"dimension": "order__status", "operator": "=", "value": "refunded"}]}
+    assert agent._coerce_stringified_lists(args) == args
+    # a string that merely starts and ends with brackets but isn't a real list is passed through
+    assert agent._coerce_stringified_lists({"sql": "[not a list, just SQL-ish text]"}) == \
+        {"sql": "[not a list, just SQL-ish text]"}
+
+
+def test_no_focus_tables_means_no_mention_and_none_passed():
+    def fake_search(**kw):
+        assert kw.get("focus") is None
+        return {"matches": []}
+
+    script = [call("search_catalog", query="x"), say("ok")]
+    seen_messages = []
+
+    def fake_chat(messages, tools=None, think=None):
+        seen_messages.append(messages[0]["content"])
+        return script.pop(0)
+
+    with tempfile.TemporaryDirectory() as d, \
+            mock.patch.object(agent, "chat", fake_chat), \
+            mock.patch.object(agent, "TOOL_IMPLS", {"search_catalog": fake_search}), \
+            mock.patch.object(agent.semantic, "ratio_metric_names", lambda: set()), \
+            mock.patch.object(settings, "AUDIT_PATH", Path(d) / "a.jsonl"), \
+            mock.patch.object(settings, "THINK", False), mock.patch.object(settings, "ESCALATE", False):
+        agent.ask("x?")
+    assert "focused this conversation on" not in seen_messages[0]

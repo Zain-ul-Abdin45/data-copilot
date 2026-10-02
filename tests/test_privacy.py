@@ -61,8 +61,24 @@ def test_disabled_bypasses_masking_entirely():
         assert rows == [["a@x.com"]] and masked == []
 
 
-def test_an_aliased_pii_column_is_a_known_gap_not_a_crash():
-    # SELECT email AS contact defeats name-based masking; documented in privacy.py's docstring.
+def test_an_aliased_pii_column_is_not_caught_by_bare_name_matching_alone():
+    # SELECT email AS contact defeats bare-name matching on its own; this is why sqlguard.validate
+    # resolves column_lineage for run_sql (see test_sqlguard.py) and passes it in here.
     with _mocked():
         rows, masked = privacy.mask_rows(["contact"], [["a@x.com"]])
         assert rows == [["a@x.com"]] and masked == []
+
+
+def test_an_aliased_pii_column_is_caught_when_lineage_is_given():
+    with _mocked():
+        rows, masked = privacy.mask_rows(["contact"], [["a@x.com"]],
+                                         column_lineage={"contact": {"email"}})
+        assert rows == [[privacy.REDACTED]] and masked == ["contact"]
+
+
+def test_lineage_is_consulted_per_column_not_all_or_nothing():
+    with _mocked():
+        rows, masked = privacy.mask_rows(
+            ["contact", "order_id"], [["a@x.com", 1]],
+            column_lineage={"contact": {"email"}, "order_id": {"order_id"}})
+        assert rows == [[privacy.REDACTED, 1]] and masked == ["contact"]

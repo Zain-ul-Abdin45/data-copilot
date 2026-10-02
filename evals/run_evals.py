@@ -6,6 +6,7 @@ Runs golden.yaml against the copilot.
     python evals/run_evals.py -k refund    # only case ids containing "refund"
     python evals/run_evals.py --repeat 3 --pause 15   # 3 runs per case, 15 s rest between questions
     python evals/run_evals.py --agent ../wren-bakeoff/agent_wren.py:ask   # another engine, same questions
+    python evals/run_evals.py --cases stress.yaml   # a different case file (e.g. the adversarial set)
 
 Results are written to evals/results/<timestamp>.json after every question, so a
 run that is interrupted still leaves something to read. To run it gently in the
@@ -34,13 +35,15 @@ NUM_RE = re.compile(r"-?\d[\d,]*\.?\d*")
 TRUTH_PREFIX = yaml.safe_load((Path(__file__).parent / "golden.yaml").read_text())["truth_prefix"]
 
 
-def truth_values(conn, case) -> list[float]:
-    """Every numeric cell of truth_sql (text cells are labels), plus x100 for pct_columns."""
+def truth_values(conn, case, truth_prefix: str = TRUTH_PREFIX) -> list[float]:
+    """Every numeric cell of truth_sql (text cells are labels), plus x100 for pct_columns.
+    `truth_prefix` defaults to golden.yaml's (oracle.py always grades golden.yaml and calls
+    this positionally); --cases passes the chosen file's own prefix instead."""
     if "truth_sql" not in case:
         return []
     sql = case["truth_sql"]
     if re.search(r"\bfrom t\b", sql):  # uses the shared per-order CTE
-        sql = TRUTH_PREFIX + sql
+        sql = truth_prefix + sql
     with conn.cursor() as cur:
         cur.execute(sql)
         cols = [d.name for d in cur.description]
@@ -55,14 +58,14 @@ def truth_values(conn, case) -> list[float]:
     return values
 
 
-def truth_rows(conn, case) -> list[tuple[str, list[float]]]:
+def truth_rows(conn, case, truth_prefix: str = TRUTH_PREFIX) -> list[tuple[str, list[float]]]:
     """(label, numeric cells) per row of truth_sql that has a text column, e.g. a payment method.
     Lets the grader check a figure sits next to the right label, not just that it appears."""
     if "truth_sql" not in case:
         return []
     sql = case["truth_sql"]
     if re.search(r"\bfrom t\b", sql):
-        sql = TRUTH_PREFIX + sql
+        sql = truth_prefix + sql
     with conn.cursor() as cur:
         cur.execute(sql)
         rows = cur.fetchall()
@@ -132,6 +135,9 @@ def grade(case, answer: str, trace: list[dict], truth, rows=()) -> list[str]:
     for phrase in case.get("must_mention", []):
         if phrase.lower() not in answer.lower():
             failures.append(f"answer does not mention: {phrase!r}")
+    for phrase in case.get("must_not_mention", []):
+        if phrase.lower() in answer.lower():
+            failures.append(f"answer wrongly mentions: {phrase!r}")
 
     found = numbers_in(answer)
     for is_pct, v in truth:
@@ -140,6 +146,33 @@ def grade(case, answer: str, trace: list[dict], truth, rows=()) -> list[str]:
             failures.append(f"expected value missing from answer: {v:g}")
     failures += mislabelled(answer, rows)
     return failures
+
+
+def run_turns(ask, turns: list[str]) -> dict:
+    """Feed a multi-turn case (`turns:` in the yaml, in place of `question:`) through `ask` one
+    question at a time, building history the same way the UI does (question + the model's own
+    words, see ui/render.py's history_entry). Returns the FINAL turn's result — the answer that
+    gets graded is only ever the last one, matching what a real user actually reads — but with
+    elapsed/wall time summed and trace/ungrounded concatenated across turns, so a stress case can
+    require a tool used on an earlier turn, or flag an earlier turn's invented figure. This is the
+    only way to reproduce the original bug report (a correct first answer, a wrongly-refused
+    follow-up): golden.yaml's single-question cases cannot exercise the follow-up path at all."""
+    history: list[dict] = []
+    combined_trace: list[dict] = []
+    combined_ungrounded: list = []
+    elapsed_s = wall_s = 0.0
+    escalated = False
+    result = None
+    for q in turns:
+        result = ask(q, history=history)
+        history.append({"question": q, "answer": result["llm_answer"].strip()})
+        combined_trace += result["trace"]
+        combined_ungrounded += result["ungrounded"]
+        elapsed_s += result["elapsed_s"]
+        wall_s += result.get("wall_s", result["elapsed_s"])
+        escalated = escalated or result["escalated"]
+    return {**result, "trace": combined_trace, "ungrounded": combined_ungrounded,
+            "elapsed_s": round(elapsed_s, 1), "wall_s": round(wall_s, 1), "escalated": escalated}
 
 
 def load_agent(spec: str):
@@ -171,17 +204,24 @@ def main():
                          "(same agent, model, --repeat and settings are required)")
     ap.add_argument("--agent", default="agent:ask",
                     help="module-or-file.py:function that answers a question (default agent:ask)")
+    ap.add_argument("--cases", default="golden.yaml",
+                    help="cases file, relative to evals/ or absolute (default golden.yaml; "
+                         "e.g. --cases stress.yaml for the adversarial set)")
     args = ap.parse_args()
 
-    cases = yaml.safe_load((Path(__file__).parent / "golden.yaml").read_text())["cases"]
-    cases = [c for c in cases if args.k in c["id"]]
+    cases_path = Path(args.cases)
+    if not cases_path.is_absolute():
+        cases_path = Path(__file__).parent / cases_path
+    cases_data = yaml.safe_load(cases_path.read_text())
+    truth_prefix = cases_data.get("truth_prefix", TRUTH_PREFIX)
+    cases = [c for c in cases_data["cases"] if args.k in c["id"]]
 
     conn = psycopg.connect(DSN)
     conn.read_only = True  # truth queries must never change data
 
     if args.truth:
         for c in cases:
-            vals = [round(v, 4) for _, v in truth_values(conn, c)]
+            vals = [round(v, 4) for _, v in truth_values(conn, c, truth_prefix)]
             print(f"{c['id']:<28} {c['category']:<11} {vals}")
         return
 
@@ -228,21 +268,22 @@ def main():
           "so expect about 40 s of silence; a line appears after every answer.", flush=True)
     try:
         for n, c in enumerate(cases, 1):
+            question = c.get("question") or " -> ".join(c["turns"])  # multi-turn: shown as the chain
             entry = next((e for e in report["cases"] if e["id"] == c["id"]), None)
             if entry is None:
-                entry = {"id": c["id"], "category": c["category"], "question": c["question"],
+                entry = {"id": c["id"], "category": c["category"], "question": question,
                          "rubric": c.get("rubric"), "passed_runs": 0, "runs": []}
                 report["cases"].append(entry)
             runs = entry["runs"]
             if len(runs) >= args.repeat:
                 print(f"=== [{n}/{len(cases)}] {c['id']}: already complete, skipped", flush=True)
                 continue
-            truth = truth_values(conn, c)
-            rows = truth_rows(conn, c) if c["category"] != "safety" else []
+            truth = truth_values(conn, c, truth_prefix)
+            rows = truth_rows(conn, c, truth_prefix) if c["category"] != "safety" else []
             for i in range(len(runs), args.repeat):  # a partly done case continues after its saved runs
                 print(f"... [{n}/{len(cases)}] {c['id']} (run {i + 1}/{args.repeat})", flush=True)
                 try:
-                    result = ask(c["question"])
+                    result = run_turns(ask, c["turns"]) if "turns" in c else ask(c["question"])
                 except Exception as e:  # noqa: BLE001  one crash must not lose the rest of the night
                     failures = [f"agent raised {type(e).__name__}: {' '.join(str(e).split())[:200]}"]
                     runs.append({"failures": failures, "elapsed_s": 0, "escalated": False,
@@ -253,7 +294,7 @@ def main():
                     if c["category"] == "safety":
                         # truth_sql is a before/after check that data is unchanged, not a value to quote
                         failures = grade(c, result["answer"], result["trace"], [])
-                        if truth_values(conn, c) != truth:
+                        if truth_values(conn, c, truth_prefix) != truth:
                             failures.append("data changed while answering a safety question")
                     else:
                         failures = grade(c, result["answer"], result["trace"], truth, rows)

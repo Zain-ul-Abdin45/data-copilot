@@ -99,11 +99,22 @@ def defining_dimensions(metric_name: str) -> set[str]:
     return found
 
 
+_GRAINS = "day|week|month|quarter|year"
+
+
 def _group_by_options(m) -> list[str]:
+    """group_by names to offer for this metric. A TIME dimension (order__order_date,
+    customer__first_order_date, ...) is offered with the same grain-choice template as
+    metric_time, not bare: its dunder_name alone defaults to day grain with no ordering
+    (query_metric only auto-orders a name ending in a grain suffix), which is how a trend
+    question silently turned into hundreds of unordered daily rows instead of ~8 monthly ones."""
     blocked = defining_dimensions(m.name)
-    names = sorted({d.dunder_name for d in m.dimensions
-                    if not d.dunder_name.startswith("metric_time") and d.dunder_name not in blocked})
-    return names + ["metric_time__day|week|month|quarter|year"]
+    options = set()
+    for d in m.dimensions:
+        if d.dunder_name.startswith("metric_time") or d.dunder_name in blocked:
+            continue
+        options.add(f"{d.dunder_name}__{_GRAINS}" if d.type.value == "time" else d.dunder_name)
+    return sorted(options) + [f"metric_time__{_GRAINS}"]
 
 
 def describe_metrics(term: str | None = None) -> dict:
@@ -180,6 +191,7 @@ def metric_summary(name: str) -> str:
 
 _OPS = {"=", "!=", "<", ">", "<=", ">=", "in", "not in"}
 _DIM = re.compile(r"^[a-z_]+__[a-z_]+$")
+_TIME_GRAIN = re.compile(r"__(?:" + _GRAINS + r")$")
 
 
 def _literal(v) -> str:
@@ -219,8 +231,11 @@ def query_metric(metrics: list[str], group_by: list[str] | None = None,
     """Query governed metrics. Errors come back as text with suggestions so the
     model can correct itself."""
     if not order_by:
-        # a trend must read left to right: MetricFlow returns buckets in no particular order
-        order_by = [g for g in group_by or [] if g.startswith("metric_time")] or None
+        # a trend must read left to right: MetricFlow returns buckets in no particular order.
+        # Matches any time-grained group_by (metric_time__month, but equally order__order_date__month
+        # or customer__first_order_date__week), not just the canonical metric_time alias — a model
+        # asking for a trend on an entity-qualified date must still get it back in date order.
+        order_by = [g for g in group_by or [] if _TIME_GRAIN.search(g)] or None
     asked = set(group_by or []) | {f.get("dimension") for f in filters or []}
     for name in metrics:
         clash = sorted(defining_dimensions(name) & asked)
@@ -254,10 +269,18 @@ def query_metric(metrics: list[str], group_by: list[str] | None = None,
 
     table = result.result_df
     rows = [[_clean(v) for v in row] for row in table.rows]
-    return {
+    out = {
         "governed": True,
         "columns": list(table.column_names),
         "rows": rows,
         "row_count": len(rows),
         "_sql": result.sql,  # audit trail only; not sent to the model
     }
+    if len(rows) >= settings.ROW_LIMIT:
+        # a capped, unlabelled result invites exactly the failure this note exists to prevent:
+        # summarising a truncated series as if it were the whole trend. Belt-and-braces alongside
+        # _group_by_options steering away from day grain in the first place.
+        out["note"] = (f"Result capped at {settings.ROW_LIMIT} rows; there may be more not shown. "
+                        "For a trend question, prefer a coarser time grain (e.g. __month or "
+                        "__quarter instead of __day) rather than summarising a truncated series.")
+    return out

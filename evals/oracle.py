@@ -69,6 +69,11 @@ def scripts(engine: str) -> dict[str, list[tuple[str, dict]]]:
                                    # which correctly fails the growth values (a declared gap).
                                    [("query_metric", {"metrics": ["net_revenue"], "group_by": [month],
                                                       "order_by": [month]})]),
+        "avg_orders_per_customer": ([("query_metric", {"metrics": ["avg_customer_lifetime_orders"]})] if mf else
+                                    # not a MetricFlow-only gap like growth: a plain average is
+                                    # answerable by any engine via ad-hoc SQL over dim_customers
+                                    [("search_catalog", {"query": "customer orders"}),
+                                     ("run_sql", {"sql": "select avg(lifetime_orders) from dim_customers"})]),
         "orders_by_status": [("query_metric", {"metrics": ["order_count"], "group_by": [status],
                                                "order_by": [status] if mf else []})],
         "top_customers": top,
