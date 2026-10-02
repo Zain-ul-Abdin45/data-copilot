@@ -1,0 +1,6 @@
+status,counts_in_gross_revenue,is_refund,counts_as_net_order,rule
+placed,true,false,true,Payment is taken when the order is placed so it counts as revenue.
+shipped,true,false,true,Counts as revenue.
+delivered,true,false,true,Counts as revenue.
+cancelled,false,false,false,Cancelled orders never earn revenue and are not net orders.
+refunded,true,true,false,Counts in gross revenue; the amount is subtracted to get net revenue.

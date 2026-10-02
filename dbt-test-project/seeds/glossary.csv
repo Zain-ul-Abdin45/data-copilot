@@ -1,0 +1,13 @@
+term,metric,rule
+revenue,net_revenue,"Unless someone says gross, 'revenue' means net revenue (gross minus refunds)."
+sales,net_revenue,Sales is used as a synonym for revenue.
+turnover,gross_revenue,Turnover means everything paid including refunded orders.
+aov,average_order_value,Net revenue divided by net orders (orders neither cancelled nor refunded).
+average order value,average_order_value,Net revenue divided by net orders (orders neither cancelled nor refunded).
+refund rate,refund_rate,Refunded orders as a share of all orders.
+cancellation rate,cancellation_rate,Cancelled orders as a share of all orders.
+orders,order_count,"All orders placed, whatever their status."
+refunded revenue,refunded_revenue,Money paid back on refunded orders (an amount). "How much was refunded" means this.
+refunded amount,refunded_revenue,Same as refunded revenue.
+refunds,refunded_revenue,"An amount of money unless someone asks how many orders were refunded (then use refunded orders, or the refund rate for a share)."
+gross revenue,gross_revenue,Everything paid including on orders that were later refunded. Cancelled orders are excluded.

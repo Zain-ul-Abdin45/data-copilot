@@ -1,0 +1,49 @@
+version: 2
+
+models:
+  - name: dim_customers
+    description: One row per customer with lifetime order count.
+    columns:
+      - name: customer_id
+        tests:
+          - unique
+          - not_null
+      - name: first_name
+        meta: {pii: true}
+      - name: last_name
+        meta: {pii: true}
+      - name: email
+        meta: {pii: true}
+      - name: lifetime_orders
+      - name: first_order_date
+        description: The date of this customer's earliest order, null if they have none.
+
+  - name: fct_orders
+    description: >
+      One row per order with the total amount paid and the business-rule flags
+      from order_status_rules. For ad-hoc money questions use the flags instead of
+      hard-coding statuses: gross revenue = order_total where counts_in_gross_revenue,
+      refunded = order_total where is_refund, net = gross - refunded.
+    columns:
+      - name: order_id
+        tests:
+          - unique
+          - not_null
+      - name: customer_id
+        tests:
+          - relationships:
+              to: ref('dim_customers')
+              field: customer_id
+      - name: order_date
+      - name: status
+        tests:
+          - relationships:
+              to: ref('order_status_rules')
+              field: status
+      - name: counts_in_gross_revenue
+        description: Business rule; payments on this order count as gross revenue.
+      - name: is_refund
+        description: Business rule; payments on this order are subtracted to get net revenue.
+      - name: counts_as_net_order
+        description: Business rule; this order counts as a net order.
+      - name: order_total

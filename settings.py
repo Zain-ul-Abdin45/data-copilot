@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-DBT_DIR = Path(os.getenv("DBT_PROJECT_DIR", ROOT.parent / "dbt-test-project"))
+DBT_DIR = Path(os.getenv("DBT_PROJECT_DIR", ROOT / "dbt-test-project"))
 
 # Which engine run_sql, the catalog and (via DBT_TARGET below) the governed path all point at.
 # Each is a separate dbt profile target in dbt-test-project/profiles.yml; see datasources/.

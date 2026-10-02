@@ -1,0 +1,36 @@
+dbt_test_project:
+  # Which output below is used; data-copilot sets DBT_TARGET to match COPILOT_DATASOURCE
+  # (see settings.py and datasources/), so switching engines is a single env var, not a
+  # profile edit. Falls back to postgres, the one measured against the golden set.
+  target: "{{ env_var('DBT_TARGET', 'postgres') }}"
+  outputs:
+    postgres:
+      type: postgres
+      host: "{{ env_var('PGHOST', 'localhost') }}"
+      port: "{{ env_var('PGPORT', '5432') | as_number }}"
+      user: "{{ env_var('PGUSER', env_var('USER', 'postgres')) }}"
+      password: "{{ env_var('PGPASSWORD', '') }}"
+      dbname: data_copilot
+      schema: analytics
+      threads: 4
+
+    # A local file, no server. `python export_to_duckdb.py` copies raw.* out of Postgres into
+    # it; `dbt seed && dbt run && dbt test --target duckdb` builds the same models on top.
+    duckdb:
+      type: duckdb
+      path: "{{ env_var('COPILOT_DUCKDB_PATH') }}"
+      schema: analytics
+      threads: 4
+
+    # Verified against a real cluster (see data-copilot/README.md's Data sources section and
+    # data-copilot/trino/docker-compose.yml): needs the dbt-trino adapter installed and a Trino
+    # cluster whose COPILOT_TRINO_CATALOG connector points at this same Postgres database's
+    # `analytics` schema (no separate build needed — Trino reads it directly).
+    trino:
+      type: trino
+      host: "{{ env_var('COPILOT_TRINO_HOST', 'localhost') }}"
+      port: "{{ env_var('COPILOT_TRINO_PORT', '8080') | as_number }}"
+      user: "{{ env_var('COPILOT_TRINO_USER', 'copilot_ro') }}"
+      catalog: "{{ env_var('COPILOT_TRINO_CATALOG', 'warehouse') }}"
+      schema: "{{ env_var('COPILOT_TRINO_SCHEMA', 'analytics') }}"
+      threads: 4

@@ -9,7 +9,7 @@ schema Postgres already has, so there is no `raw.*` copy step the way DuckDB's v
 docker compose up -d                       # trinodb/trino on localhost:8080
 ```
 
-Then, from `../dbt-test-project` and `../data-copilot` respectively (see the root README's
+Then, from `../dbt-test-project` and the repo root (`..`) respectively (see the root README's
 **Data sources** section for the exact commands): `dbt parse --target trino`, then run the agent
 or `evals/oracle.py --engine metricflow` with `COPILOT_DATASOURCE=trino` and the `COPILOT_TRINO_*`
 variables set to match this compose file (host `localhost`, port `8080`, catalog `warehouse`,

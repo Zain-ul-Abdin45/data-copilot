@@ -5,8 +5,8 @@ models and the same governed metrics on top of it — the point being that switc
 COPILOT_DATASOURCE=duckdb changes nothing else.
 
     python export_to_duckdb.py
-    cd ../dbt-test-project && DBT_TARGET=duckdb COPILOT_DUCKDB_PATH=.../warehouse.duckdb \\
-        ../data-copilot/.venv/bin/dbt seed && ... dbt run && ... dbt test
+    cd dbt-test-project && DBT_TARGET=duckdb COPILOT_DUCKDB_PATH=.../warehouse.duckdb \\
+        ../.venv/bin/dbt seed && ... dbt run && ... dbt test
 
 Reads raw.* as the database owner (needs to see the raw schema, which copilot_ro cannot);
 never touches the copilot_ro role or the analytics schema, both of which dbt owns.

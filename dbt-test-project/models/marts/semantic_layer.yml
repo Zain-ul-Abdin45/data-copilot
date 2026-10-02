@@ -1,0 +1,211 @@
+version: 2
+
+# Governed business definitions. The agent asks for a metric by name; MetricFlow
+# compiles the SQL. Change a definition here and every answer changes with it.
+#
+# Which statuses count as revenue, refunds or net orders is NOT decided here:
+# it comes from the order_status_rules seed (seeds/order_status_rules.csv), so
+# the business can change it without touching MetricFlow. Word-to-metric
+# mapping ("revenue" -> net_revenue) lives in seeds/glossary.csv.
+# Structure that stays fixed here: net revenue = gross - refunded, and average
+# order value = net revenue / net orders.
+
+semantic_models:
+  - name: orders
+    description: One row per order with the total amount paid.
+    model: ref('fct_orders')
+    defaults:
+      agg_time_dimension: order_date
+
+    entities:
+      - name: order
+        type: primary
+        expr: order_id
+      - name: customer
+        type: foreign
+        expr: customer_id
+
+    dimensions:
+      - name: order_date
+        type: time
+        type_params:
+          time_granularity: day
+      - name: status
+        type: categorical
+        description: "Order lifecycle state: placed, shipped, delivered, cancelled or refunded."
+
+    measures:
+      # Status logic lives in the measures (CASE, not metric filters) so every
+      # order row contributes 0 or a value. Filtered metrics drop rows and turn
+      # "no refunds this month" into NULL instead of 0.
+      - name: orders
+        description: Number of orders.
+        agg: sum
+        expr: "1"
+      - name: cancelled_orders
+        description: Number of orders with status cancelled.
+        agg: sum
+        expr: "case when status = 'cancelled' then 1 else 0 end"
+      - name: refunded_orders
+        description: Number of orders with status refunded.
+        agg: sum
+        expr: "case when status = 'refunded' then 1 else 0 end"
+      - name: net_orders
+        description: Number of orders that were neither cancelled nor refunded.
+        agg: sum
+        expr: "case when counts_as_net_order then 1 else 0 end"
+      - name: amount_paid
+        description: Total payments received against orders.
+        agg: sum
+        expr: "case when counts_in_gross_revenue then coalesce(order_total, 0) else 0 end"
+      - name: amount_refunded
+        description: Payments received on orders with status refunded.
+        agg: sum
+        expr: "case when is_refund then coalesce(order_total, 0) else 0 end"
+
+  - name: customers
+    description: One row per customer.
+    model: ref('dim_customers')
+    defaults:
+      agg_time_dimension: first_order_date
+
+    entities:
+      - name: customer
+        type: primary
+        expr: customer_id
+
+    dimensions:
+      - name: first_order_date
+        type: time
+        type_params:
+          time_granularity: day
+      - name: first_name
+        type: categorical
+      - name: last_name
+        type: categorical
+
+    measures:
+      - name: lifetime_orders
+        description: Number of orders (any status) a customer has ever placed.
+        agg: average
+
+metrics:
+  - name: avg_customer_lifetime_orders
+    label: Average orders per customer
+    description: Average number of orders (any status, including customers with none) per
+      customer. Built on the customers table, not orders — unlike every other metric here.
+    type: simple
+    type_params:
+      measure: lifetime_orders
+
+  - name: order_count
+    label: Orders
+    description: All orders placed, regardless of status.
+    type: simple
+    type_params:
+      measure: orders
+
+  - name: cancelled_order_count
+    label: Cancelled orders
+    description: Orders with status cancelled.
+    type: simple
+    type_params:
+      measure: cancelled_orders
+
+  - name: refunded_order_count
+    label: Refunded orders
+    description: Orders with status refunded.
+    type: simple
+    type_params:
+      measure: refunded_orders
+
+  - name: net_order_count
+    label: Net orders
+    description: Orders that were neither cancelled nor refunded.
+    type: simple
+    type_params:
+      measure: net_orders
+
+  - name: gross_revenue
+    label: Gross revenue
+    description: Total money received (an amount), including on orders that were later refunded.
+    type: simple
+    type_params:
+      measure: amount_paid
+
+  - name: refunded_revenue
+    label: Refunded revenue
+    description: "Money refunded (an amount): payments received on orders with status refunded. Use it for \"how much was refunded\"."
+    type: simple
+    type_params:
+      measure: amount_refunded
+
+  - name: net_revenue
+    label: Net revenue
+    description: Gross revenue minus refunded revenue. This is what "revenue" means unless stated otherwise.
+    type: derived
+    type_params:
+      expr: gross_revenue - refunded_revenue
+      metrics:
+        - name: gross_revenue
+        - name: refunded_revenue
+
+  - name: average_order_value
+    label: Average order value
+    description: Net revenue divided by net orders.
+    type: derived
+    type_params:
+      expr: net_revenue / nullif(net_order_count, 0)
+      metrics:
+        - name: net_revenue
+        - name: net_order_count
+
+  - name: refund_rate
+    label: Refund rate
+    description: "Share of all ORDERS (a count, not money) that were refunded. For the amount refunded use refunded_revenue."
+    type: ratio
+    type_params:
+      numerator: refunded_order_count
+      denominator: order_count
+
+  - name: cancellation_rate
+    label: Cancellation rate
+    description: Share of all orders that were cancelled.
+    type: ratio
+    type_params:
+      numerator: cancelled_order_count
+      denominator: order_count
+
+  # Month-over-month change, computed by MetricFlow (offset_window), not by the model doing
+  # arithmetic across rows it can get wrong. Query net_revenue_growth_mom grouped by
+  # metric_time__month; the first month in any range has no prior month, so it is null there.
+  - name: net_revenue_prior_month
+    label: Net revenue, prior month
+    description: Net revenue from the calendar month before the one being reported. An input to
+      the month-over-month metrics, not usually asked for directly.
+    type: derived
+    type_params:
+      expr: net_revenue_prior_month
+      metrics:
+        - name: net_revenue
+          offset_window: 1 month
+          alias: net_revenue_prior_month
+
+  - name: net_revenue_change_mom
+    label: Net revenue change, month over month
+    description: Net revenue minus net revenue from the prior calendar month (an amount, not a
+      percentage; see net_revenue_growth_mom for that).
+    type: derived
+    type_params:
+      expr: net_revenue - net_revenue_prior_month
+      metrics:
+        - name: net_revenue
+        - name: net_revenue_prior_month
+
+  - name: net_revenue_growth_mom
+    label: Net revenue growth, month over month
+    description: Percentage change in net revenue versus the prior calendar month.
+    type: ratio
+    type_params:
+      numerator: net_revenue_change_mom
+      denominator: net_revenue_prior_month

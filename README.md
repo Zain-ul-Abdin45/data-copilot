@@ -85,10 +85,10 @@ DuckDB, tried end to end on this project's data:
 
 ```
 python export_to_duckdb.py                          # copies raw.* out of Postgres into a file
-cd ../dbt-test-project
-DBT_TARGET=duckdb COPILOT_DUCKDB_PATH=$(pwd)/../data-copilot/warehouse.duckdb \
-  ../data-copilot/.venv/bin/dbt seed && ... dbt run && ... dbt test   # 23/23 pass, same as Postgres
-cd ../data-copilot
+cd dbt-test-project
+DBT_TARGET=duckdb COPILOT_DUCKDB_PATH=$(pwd)/../warehouse.duckdb \
+  ../.venv/bin/dbt seed && ... dbt run && ... dbt test   # 23/23 pass, same as Postgres
+cd ..
 COPILOT_DATASOURCE=duckdb DBT_TARGET=duckdb .venv/bin/python agent.py "What is our net revenue?"
 # -> 20,486.14 — identical to the Postgres answer, same model, same question
 ```
@@ -103,8 +103,8 @@ cd trino && docker compose up -d                     # trinodb/trino + a postgre
 cd ../dbt-test-project
 DBT_TARGET=trino COPILOT_TRINO_HOST=localhost COPILOT_TRINO_PORT=8080 \
   COPILOT_TRINO_USER=copilot_ro COPILOT_TRINO_CATALOG=warehouse COPILOT_TRINO_SCHEMA=analytics \
-  ../data-copilot/.venv/bin/dbt parse
-cd ../data-copilot
+  ../.venv/bin/dbt parse
+cd ..
 COPILOT_DATASOURCE=trino DBT_TARGET=trino COPILOT_TRINO_HOST=localhost COPILOT_TRINO_PORT=8080 \
   COPILOT_TRINO_USER=copilot_ro COPILOT_TRINO_CATALOG=warehouse COPILOT_TRINO_SCHEMA=analytics \
   .venv/bin/python evals/oracle.py --engine metricflow
@@ -139,18 +139,17 @@ determined query — the database role remains the actual trust boundary. See `p
 
 ## Run it
 
-Needs: Python 3.11+, a local Postgres server, [Ollama](https://ollama.com), and the
-`dbt-test-project` sibling directory (business rules, dbt models, the semantic layer — see
-**Known limits** for where that currently lives).
+Needs: Python 3.11+, a local Postgres server, and [Ollama](https://ollama.com). Everything else,
+including the dbt project (business rules, models, the semantic layer), is in this repository.
 
 ```
+git clone https://github.com/Zain-ul-Abdin45/data-copilot && cd data-copilot
 python -m venv .venv && .venv/bin/pip install -r requirements.txt
 cp .env.example .env && set -a && source .env && set +a   # or just export the ones you need
 createdb data_copilot && psql -d data_copilot -f setup_db.sql
 .venv/bin/python seed_db.py                       # raw tables
-cd ../dbt-test-project && ../data-copilot/.venv/bin/dbt seed && \
-  ../data-copilot/.venv/bin/dbt run && ../data-copilot/.venv/bin/dbt test
-cd ../data-copilot
+cd dbt-test-project && ../.venv/bin/dbt seed && ../.venv/bin/dbt run && ../.venv/bin/dbt test
+cd ..
 ollama pull qwen3:14b
 .venv/bin/python agent.py "What is our net revenue by month?"
 .venv/bin/uvicorn main:app                          # POST /ask {"question": "..."}
@@ -238,7 +237,7 @@ is a thin Chainlit wrapper.
 
 ## Changing business rules
 
-Edit the CSVs in `../dbt-test-project/seeds/` (see the README there), rebuild
+Edit the CSVs in `dbt-test-project/seeds/` (see the README there), rebuild
 with dbt, then run `python evals/check_semantic_layer.py`.
 
 ## Tests
@@ -258,18 +257,11 @@ analytics, cannot write, cannot see `raw`), Ollama and model presence, consisten
 stub agent, then driven over its socket like a browser: two turns, charts, calculation panel, no errors, history
 carried).
 
-**CI** (`.github/workflows/tests.yml`) runs just the stubbed unit tests (`python tests/run_light.py`)
-on every push — no Postgres, no Ollama, no real dbt project. `dbtproject.load` reads
-`target/manifest.json`/`semantic_manifest.json` as plain JSON files, with no dbt process
-involved unless they're stale; CI points `DBT_PROJECT_DIR` at `tests/fixtures/dbt_target`, a
-frozen copy of those two files trimmed to what `catalog.py`/`privacy.py`/`semantic.py` actually
-read (dbt-test-project itself is a separate, unversioned sibling project, so it can't be CI's
-source — see the handoff notes). One test calls `describe_metrics` with nothing stubbed, which
-goes through the real MetricFlow engine and needs a full local dbt project (profiles.yml, a real
-`dbt parse`), not just those two files; `COPILOT_LIGHT_TESTS_NO_LIVE_ENGINE=1` skips exactly that
-one in CI, and `tests/run_light.py` says why. A local run with the real dbt-test-project is
-unaffected either way and runs every test as before.
-carried).
+**CI** (`.github/workflows/tests.yml`) runs the stubbed unit tests (`python tests/run_light.py`)
+on every push — no Postgres, no Ollama. It does one real `dbt parse` against `dbt-test-project/`
+first: that needs no database connection at all (verified live — `dbt parse`, and even
+MetricFlow's own `list_metrics()`, succeed with no reachable Postgres), so every test runs for
+real in CI, none stubbed out or skipped.
 
 The oracle is a scripted "perfect model" driving the real agent loop, the real tools
 and the real grader. If it passes, a night-run failure is the model's behaviour, not a
@@ -321,11 +313,6 @@ tables and fast-first escalation, so they need re-measuring (`sh evals/night.sh`
 
 ## Known limits
 
-- **`dbt-test-project` is not in this repository.** It's a separate, unversioned sibling
-  directory this project was developed alongside (business rules, dbt models,
-  `semantic_layer.yml`'s metric definitions — everything **Business rules**, **Changing business
-  rules** and **Run it** above point at). Cloning just this repo is not enough to run it end to
-  end yet; see the project board / open an issue if you're hitting this as an outside contributor.
 - The grounding check finds invented figures. It cannot tell whether allowed
   arithmetic is meaningful (a share of the wrong two numbers passes).
 - Small prompt or description changes can flip whether the 14B model adds a `group_by` nobody asked for (it did on

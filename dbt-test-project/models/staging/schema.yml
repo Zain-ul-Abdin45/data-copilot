@@ -1,0 +1,54 @@
+version: 2
+
+sources:
+  - name: raw
+    schema: raw
+    tables:
+      - name: customers
+      - name: orders
+      - name: payments
+
+models:
+  - name: stg_customers
+    description: One row per customer, cleaned from raw.customers.
+    columns:
+      - name: customer_id
+        tests:
+          - unique
+          - not_null
+      - name: first_name
+        meta: {pii: true}
+      - name: last_name
+        meta: {pii: true}
+      - name: email
+        meta: {pii: true}
+
+  - name: stg_orders
+    description: One row per order (status and date), cleaned from raw.orders. Join to payments on order_id.
+    columns:
+      - name: order_id
+        tests:
+          - unique
+          - not_null
+      - name: customer_id
+        tests:
+          - relationships:
+              to: ref('stg_customers')
+              field: customer_id
+      - name: order_date
+      - name: status
+
+  - name: stg_payments
+    description: One row per payment with its method (payment_method) and amount. Join to orders on order_id.
+    columns:
+      - name: payment_id
+        tests:
+          - unique
+          - not_null
+      - name: order_id
+        tests:
+          - relationships:
+              to: ref('stg_orders')
+              field: order_id
+      - name: payment_method
+      - name: amount

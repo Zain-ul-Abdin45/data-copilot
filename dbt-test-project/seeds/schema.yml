@@ -1,0 +1,39 @@
+version: 2
+
+seeds:
+  - name: order_status_rules
+    description: >
+      Business rules for what each order status means for money. Edit the CSV,
+      then run `dbt seed && dbt run && dbt test`. Every status that appears in
+      orders must have exactly one row here.
+    config:
+      column_types:
+        counts_in_gross_revenue: boolean
+        is_refund: boolean
+        counts_as_net_order: boolean
+    columns:
+      - name: status
+        tests: [unique, not_null]
+      - name: counts_in_gross_revenue
+        description: Payments on orders in this status are part of gross revenue.
+        tests: [not_null]
+      - name: is_refund
+        description: Payments on orders in this status are subtracted from gross to get net revenue.
+        tests: [not_null]
+      - name: counts_as_net_order
+        description: Orders in this status count in the denominator of average order value.
+        tests: [not_null]
+      - name: rule
+        description: The rule in plain language, shown to users when they ask how a number is calculated.
+
+  - name: glossary
+    description: >
+      Maps the words people use to governed metrics, so "revenue" always
+      resolves to the same metric. `metric` must be a metric defined in
+      semantic_layer.yml.
+    columns:
+      - name: term
+        tests: [unique, not_null]
+      - name: metric
+        tests: [not_null]
+      - name: rule

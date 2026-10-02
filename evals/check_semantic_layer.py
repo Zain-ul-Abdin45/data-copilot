@@ -23,7 +23,7 @@ from run_evals import DSN, close, truth_values
 
 ROOT = Path(__file__).resolve().parent.parent
 BIN = ROOT / ".venv" / "bin"
-DBT_DIR = ROOT.parent / "dbt-test-project"
+DBT_DIR = ROOT / "dbt-test-project"
 
 # case id -> the metric request the agent is expected to make
 REQUESTS = {
