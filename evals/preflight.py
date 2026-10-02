@@ -267,9 +267,6 @@ def tool_contracts():
         "rates refuse their own dimension, other metrics still group, an absent topic is reported as unavailable")
 
 
-import contextlib
-
-
 @contextlib.contextmanager
 def _serve_ui():
     """The interface (stub agent, no model) on a free port; yields (port, page_html)."""

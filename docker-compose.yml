@@ -1,0 +1,58 @@
+# One-command setup for the real, model-backed path — no local Postgres or Ollama install.
+#
+#   docker compose up -d postgres ollama
+#   docker compose exec ollama ollama pull qwen3:14b     # ~9GB, one-time, grab a coffee
+#   docker compose up app
+#   open http://localhost:8000
+#
+# For the no-model UI tour instead (COPILOT_UI_STUB=1, matches docs/screenshot.png), skip
+# ollama and the pull: `docker compose run -e COPILOT_UI_STUB=1 --service-ports app`.
+#
+# Everything else (DuckDB, Trino, the bare API via main.py) is still the README's manual path —
+# this covers the default Postgres + Chainlit setup people hit first.
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: data_copilot
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./setup_db.sql:/docker-entrypoint-initdb.d/01-setup.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d data_copilot"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+
+  app:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      COPILOT_DB_HOST: postgres
+      COPILOT_DB_NAME: data_copilot
+      COPILOT_DB_USER: copilot_ro
+      COPILOT_DB_PASSWORD: copilot_ro
+      PGHOST: postgres
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      DATABASE_URL: "host=postgres dbname=data_copilot user=postgres password=postgres"
+      OLLAMA_URL: "http://ollama:11434/api/chat"
+    ports:
+      - "8000:8000"
+
+volumes:
+  pgdata:
+  ollama:

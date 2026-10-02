@@ -1,9 +1,15 @@
 # Data Copilot
 
+[![tests](https://github.com/Zain-ul-Abdin45/data-copilot/actions/workflows/tests.yml/badge.svg)](https://github.com/Zain-ul-Abdin45/data-copilot/actions/workflows/tests.yml)
+
 A self-hosted assistant for questions about a warehouse — Postgres, a local DuckDB file, or
 Trino. It answers from governed metrics first and says so when it cannot.
 
 ![A question answered from a governed metric: badge, table, the "How this was calculated" panel with the tool trace and SQL, and a chart — all from one real run of the interface (COPILOT_UI_STUB=1, no model needed to reproduce this exact screen).](docs/screenshot.png)
+
+Try the screen above with no setup — no Postgres, no Ollama: `git clone` this repo, then
+`pip install -r requirements.txt && COPILOT_UI_STUB=1 sh ui/run.sh` and open
+`http://127.0.0.1:8000`. **Run it** below is the real, model-backed path.
 
 ```
 question ─► Qwen3 (Ollama) ─► describe_metrics ─┐
@@ -153,6 +159,17 @@ cd ..
 ollama pull qwen3:14b
 .venv/bin/python agent.py "What is our net revenue by month?"
 .venv/bin/uvicorn main:app                          # POST /ask {"question": "..."}
+```
+
+**Or with Docker** (no local Postgres/Ollama install — `docker-compose.yml` builds the warehouse
+and runs the dbt tests automatically on every start):
+
+```
+git clone https://github.com/Zain-ul-Abdin45/data-copilot && cd data-copilot
+docker compose up -d postgres ollama
+docker compose exec ollama ollama pull qwen3:14b     # ~9GB, one-time
+docker compose up app                                # seeds, dbt build+test, then the UI
+open http://localhost:8000
 ```
 
 Every setting above is an environment variable — `.env.example` lists all of them, grouped the

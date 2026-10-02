@@ -1,6 +1,8 @@
 .venv/
 __pycache__/
 *.pyc
+.mypy_cache/
+.ruff_cache/
 logs/
 evals/results/
 # a stray default config chainlit writes to the CWD if ever run from the repo root instead of
@@ -17,5 +19,9 @@ warehouse.duckdb
 .pytest_cache/
 .vscode/
 .idea/
+
+# personal/maintainer notes — not meant to be public on this repo
+/ROADMAP.md
+/NEXT_STEPS.md
 
 .DS_Store

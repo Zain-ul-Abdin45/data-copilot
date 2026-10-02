@@ -1,0 +1,6 @@
+[tool.ruff]
+extend-exclude = ["dbt-test-project", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F"]
+ignore = ["E501"]  # this codebase's style is dense, information-per-line over 88 cols
