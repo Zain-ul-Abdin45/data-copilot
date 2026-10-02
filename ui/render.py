@@ -223,9 +223,11 @@ def _step_line(i: int, step: dict) -> list[str]:
 
 
 def details_md(result: dict) -> str:
+    # No "#### How this was calculated" heading here: the cl.Text element wrapping this
+    # content (ui/app.py) is already named "How this was calculated" and Chainlit renders
+    # that name as the panel's own title, so a heading repeated inside the body duplicated it.
     footer = [ln[2:] for ln in result.get("footer_md", "").splitlines() if ln.startswith("- ")]
-    lines = ["#### How this was calculated", ""] + [f"- {f}" for f in footer] if footer else \
-        ["#### How this was calculated", "", "- No data query was run for this answer."]
+    lines = [f"- {f}" for f in footer] if footer else ["- No data query was run for this answer."]
     if result["trace"]:
         lines += ["", "#### Steps", ""]
         for i, step in enumerate(result["trace"], 1):
