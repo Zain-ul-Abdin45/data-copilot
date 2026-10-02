@@ -22,5 +22,10 @@ fi
 
 python ui/harden.py
 
-echo "Starting the UI on http://0.0.0.0:8000 ..."
-exec chainlit run ui/app.py --host 0.0.0.0 --port 8000 --headless
+echo "Starting the UI on http://0.0.0.0:${PORT:-8000} ..."
+# Chainlit resolves public/, .chainlit/ and .files/ against its OWN working directory
+# (chainlit/config.py: APP_ROOT = os.getcwd()), not against app.py's location — must cd into
+# ui/ first (ui/run.sh does the same) or custom elements like public/elements/TableFocus.jsx
+# 404 at runtime even though the file is right there in the image.
+cd ui
+exec chainlit run app.py --host 0.0.0.0 --port "${PORT:-8000}" --headless
